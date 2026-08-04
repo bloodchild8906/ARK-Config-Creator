@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARK Config Creator — ASA Server Settings</title>
+<link rel="stylesheet" href="styles.css?v=20">
+<link rel="icon" type="image/png" href="badge.png">
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <img src="badge.png" class="logo-img" alt="ARK Config Creator" onerror="this.style.display='none'">
+    <h1><span class="brand-ark">ARK</span> <span class="brand-cc">Config</span> <span class="brand-cc2">Creator</span>
+      <small>ARK: Survival Ascended server settings — no coding needed</small>
+    </h1>
+  </div>
+  <div class="search-wrap">
+    <input id="searchBox" type="search" placeholder="Search all settings… (e.g. taming, decay, turret)">
+    <kbd>Ctrl F</kbd>
+  </div>
+  <div class="hbtns">
+    <button class="btn" id="btnPresets" title="Start from a ready-made setup"><span data-ic="sparkles"></span> Presets</button>
+    <button class="btn" id="btnImport" title="Load an existing .ini file"><span data-ic="folder"></span> Import</button>
+    <button class="btn primary" id="btnExport" title="Create your config files"><span data-ic="save"></span> Create Files</button>
+    <button class="btn" id="btnUpdateApp" title="Install a newer ARK Config Creator setup file" hidden><span data-ic="download"></span> Update App</button>
+    <button class="btn" id="btnTheme" title="Switch light/dark theme" aria-label="Switch light/dark theme"><span data-ic="theme"></span></button>
+    <button class="btn danger" id="btnResetAll" title="Reset every setting to default" aria-label="Reset every setting to default"><span data-ic="reset"></span></button>
+  </div>
+</header>
+
+<div class="layout">
+  <nav id="sidebar"></nav>
+  <main>
+    <div class="cat-header" id="catHeader"></div>
+    <div class="toolbar-row" id="toolbarRow">
+      <label><input type="checkbox" id="chkChangedOnly"> Show only settings I changed</label>
+      <span id="changedTotal" style="font-size:.85rem;color:var(--muted)"></span>
+    </div>
+    <div class="opt-grid" id="optGrid"></div>
+    <footer>
+      <img src="logo.png" alt="" onerror="this.style.display='none'">
+      <b>ARK Config Creator</b> v<span id="appVersion">1.0.1</span> — unofficial fan tool for ARK: Survival Ascended server owners.<br>
+      Not affiliated with Studio Wildcard. Your settings are stored on this computer only.<br>
+      <span class="footer-links">
+        <button class="linklike" data-legal="terms">Terms of Use</button>
+        <button class="linklike" data-legal="privacy">Privacy</button>
+        <button class="linklike" data-legal="licence">Licence</button>
+      </span>
+    </footer>
+  </main>
+</div>
+
+<!-- ===== Export modal ===== -->
+<dialog id="dlgExport">
+  <div class="modal-head">
+    <h3><span data-ic="save" data-ic-size="20"></span> Your Config Files</h3>
+    <button class="close-x" data-close aria-label="Close"><span data-ic="x"></span></button>
+  </div>
+  <div class="modal-body">
+    <div class="tabs" id="exportTabs">
+      <button class="tab active" data-file="gus">GameUserSettings.ini</button>
+      <button class="tab" data-file="game">Game.ini</button>
+      <button class="tab" data-file="bat">StartServer.bat</button>
+    </div>
+    <div class="modal-row">
+      <label style="font-size:.85rem;display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="chkIncludeDefaults"> Also write unchanged (default) values
+      </label>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn small" id="btnCopyFile"><span data-ic="copy"></span> Copy</button>
+      <button class="btn small primary" id="btnDownloadFile"><span data-ic="download"></span> Download this file</button>
+      <button class="btn small" id="btnDownloadAll"><span data-ic="download"></span> Download all</button>
+    </div>
+    <pre class="file-preview" id="filePreview"></pre>
+    <div class="hint-box" id="exportHint">
+      <b>Where do these files go?</b><br>
+      On your server machine, place both .ini files in:<br>
+      <code>…\ARK Survival Ascended Server\ShooterGame\Saved\Config\WindowsServer\</code><br>
+      (For rented servers, most hosts have a config file editor or FTP access — upload/paste them there.)
+      Restart the server after changing files. <b>Tip:</b> keep a backup of your old files first!<br>
+      <b>Skip the file juggling:</b> the Deploy tab in the sidebar can write these straight to Nitrado,
+      a Pterodactyl panel, or a self-hosted server — with automatic backups.
+    </div>
+  </div>
+</dialog>
+
+<!-- ===== Import modal ===== -->
+<dialog id="dlgImport">
+  <div class="modal-head">
+    <h3><span data-ic="folder" data-ic-size="20"></span> Import Existing Config</h3>
+    <button class="close-x" data-close aria-label="Close"><span data-ic="x"></span></button>
+  </div>
+  <div class="modal-body">
+    <div class="drop-zone" id="dropZone">
+      Drag &amp; drop your <b>GameUserSettings.ini</b>, <b>Game.ini</b> or a saved profile (.json) here<br>
+      — or —<br><br>
+      <button class="btn" id="btnPickFile">Choose file…</button>
+      <input type="file" id="fileInput" accept=".ini,.txt,.json" multiple style="display:none">
+    </div>
+    <p style="font-size:.85rem;color:var(--muted);margin:8px 0 6px">…or paste the file contents below:</p>
+    <textarea id="importPaste" placeholder="[ServerSettings]&#10;TamingSpeedMultiplier=5.0&#10;XPMultiplier=3.0&#10;…"></textarea>
+    <div class="modal-row">
+      <span style="font-size:.8rem;color:var(--muted)">Settings this tool doesn't recognize are kept safely in “Custom / Extra Lines”.</span>
+      <span style="flex:1"></span>
+      <button class="btn primary" id="btnDoImport">Import pasted text</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- ===== Presets modal ===== -->
+<dialog id="dlgPresets">
+  <div class="modal-head">
+    <h3><span data-ic="sparkles" data-ic-size="20"></span> Ready-Made Setups</h3>
+    <button class="close-x" data-close aria-label="Close"><span data-ic="x"></span></button>
+  </div>
+  <div class="modal-body">
+    <p style="font-size:.85rem;color:var(--muted);margin-bottom:14px">
+      A preset fills in a set of popular values — you can still tweak everything afterwards.
+      Applying a preset only changes the settings it includes; everything else stays as it is.
+    </p>
+    <div id="presetList"></div>
+    <div class="hint-box">
+      You can also save your whole setup as a profile file and load it later:
+      <div class="modal-row" style="margin-bottom:0">
+        <button class="btn small" id="btnSaveProfile"><span data-ic="download"></span> Save my setup (.json)</button>
+        <span style="font-size:.8rem">Load it back via Import.</span>
+      </div>
+    </div>
+  </div>
+</dialog>
+
+<!-- ===== Mod Browser modal ===== -->
+<dialog id="dlgMods">
+  <div class="modal-head">
+    <h3><span data-ic="puzzle" data-ic-size="20"></span> Mod Browser <span style="font-weight:400;color:var(--muted);font-size:.8rem">CurseForge catalog</span></h3>
+    <button class="close-x" data-close aria-label="Close"><span data-ic="x"></span></button>
+  </div>
+  <div class="modal-body">
+    <div class="modal-row" style="margin-top:0">
+      <input id="modSearch" type="search" placeholder="Search mods…"
+        style="flex:1;min-width:180px;padding:9px 13px;border-radius:999px;border:1px solid var(--border);background:var(--card);outline:none;font-size:.9rem">
+      <select id="modCatFilter"><option value="all">All categories</option></select>
+      <select id="modSort">
+        <option value="dl">Most downloaded</option>
+        <option value="ini">Most configurable</option>
+        <option value="name">Name A–Z</option>
+      </select>
+    </div>
+    <div class="mod-grid" id="modGrid"></div>
+    <div class="hint-box">
+      <b>Don't see your mod?</b> Add any CurseForge mod by its project ID (shown on the mod page) or by pasting the page URL —
+      the tool looks up the mod page live and even scans it for INI settings.
+      <div class="modal-row" style="margin-bottom:0">
+        <input id="modAddId2" type="text" placeholder="e.g. 927090 or https://www.curseforge.com/ark-survival-ascended/mods/…"
+          style="flex:1;min-width:220px;padding:8px 11px;border-radius:8px;border:1px solid var(--border);background:var(--bg2);outline:none;font-size:.85rem">
+        <button class="btn small primary" id="btnModAddById2"><span data-ic="plus"></span> Add</button>
+      </div>
+      <span style="font-size:.76rem">Catalog bundled on <span id="modDbDate"></span> · every mod verified as an <b>ARK: Survival Ascended</b> project (ASE mods are rejected) · mod data © their authors · needs internet only for live lookups &amp; thumbnails.</span>
+    </div>
+  </div>
+</dialog>
+
+<!-- ===== Visual entry builder modal ===== -->
+<dialog id="dlgBuilder">
+  <div class="modal-head">
+    <h3 id="builderTitle">Edit</h3>
+    <button class="close-x" data-close aria-label="Close"><span data-ic="x"></span></button>
+  </div>
+  <div class="modal-body" id="builderBody"></div>
+</dialog>
+
+<!-- ===== Dino / Engram picker modal ===== -->
+<dialog id="dlgPicker">
+  <div class="modal-head">
+    <h3 id="pickerTitle">Pick…</h3>
+    <button class="close-x" data-close aria-label="Close"><span data-ic="x"></span></button>
+  </div>
+  <div class="modal-body">
+    <input id="pickerSearch" type="search" placeholder="Type to search…"
+      style="width:100%;padding:9px 13px;border-radius:999px;border:1px solid var(--border);background:var(--card);outline:none;font-size:.9rem;margin-bottom:10px">
+    <p id="pickerHint" class="opt-help" style="margin-bottom:8px"></p>
+    <div class="picker-list" id="pickerList"></div>
+  </div>
+</dialog>
+
+<div id="toast"></div>
+
+<script src="icons.js?v=20"></script>
+<script src="picker-db.js?v=20"></script>
+<script src="data.js?v=20"></script>
+<script src="mods-db.js?v=20"></script>
+<script src="mods.js?v=20"></script>
+<script src="builders.js?v=20"></script>
+<script src="deploy.js?v=20"></script>
+<script src="server-setup.js?v=21"></script>
+<script src="auth.js?v=20"></script>
+<script src="legal.js?v=20"></script>
+<script src="wizard.js?v=20"></script>
+<script src="app.js?v=20"></script>
+</body>
+</html>

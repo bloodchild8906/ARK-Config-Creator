@@ -1,0 +1,36 @@
+name: Local server setup help
+description: Get help with installing, deploying, or starting a local ASA server.
+title: "[Local server]: "
+labels: [support, local-server]
+body:
+  - type: markdown
+    attributes:
+      value: "Never post admin passwords, API tokens, private IP addresses, or complete server configs."
+  - type: input
+    id: version
+    attributes:
+      label: ARK Config Creator version
+      placeholder: "1.0.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Setup stage
+      options:
+        - Selecting a folder
+        - SteamCMD download
+        - Dedicated-server install/update
+        - Config deployment
+        - Persistent console service
+        - Starting the server
+        - Connecting players
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What happened?
+      description: Include the safe portion of the progress or console message.
+    validations:
+      required: true

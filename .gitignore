@@ -1,0 +1,19 @@
+# Dependencies and generated packages
+node_modules/
+dist/
+
+# Local IDE and assistant settings
+.idea/
+.claude/
+.vscode/
+
+# Local configuration, logs, and operating-system files
+.env
+.env.*
+*.log
+*.bak
+*.db
+*.sqlite
+*.sqlite3
+Thumbs.db
+.DS_Store

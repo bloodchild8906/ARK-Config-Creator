@@ -1,0 +1,91 @@
+{
+  "name": "ark-config-creator",
+  "productName": "ARK Config Creator",
+  "version": "1.0.1",
+  "description": "ARK: Survival Ascended server config creator \u2014 friendly settings, mods, and one-click deploys.",
+  "author": "ARK Config Creator",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke",
+    "legal": "node tools/gen-legal.js",
+    "dist": "node tools/gen-legal.js && electron-builder --win nsis",
+    "setup": "powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1"
+  },
+  "devDependencies": {
+    "electron": "^37.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.arkconfigcreator.app",
+    "productName": "ARK Config Creator",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "db.js",
+      "index.html",
+      "app.js",
+      "auth.js",
+      "wizard.js",
+      "builders.js",
+      "data.js",
+      "deploy.js",
+      "server-setup.js",
+      "server-service.js",
+      "legal.js",
+      "icons.js",
+      "mods.js",
+      "mods-db.js",
+      "picker-db.js",
+      "styles.css",
+      "logo.png",
+      "badge.png"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "license": "EULA.txt",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "uninstallerSidebar": "build/installerSidebar.bmp",
+      "installerHeader": "build/installerHeader.bmp",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ARK Config Creator",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "ARK-Config-Creator-Setup-${version}.${ext}",
+      "include": "build/installer.nsh",
+      "warningsAsErrors": false
+    },
+    "extraResources": [
+      {
+        "from": "TERMS.txt",
+        "to": "TERMS.txt"
+      },
+      {
+        "from": "PRIVACY.txt",
+        "to": "PRIVACY.txt"
+      },
+      {
+        "from": "LICENSE.txt",
+        "to": "LICENSE.txt"
+      },
+      {
+        "from": "README.txt",
+        "to": "README.txt"
+      }
+    ]
+  }
+}

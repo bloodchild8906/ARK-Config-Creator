@@ -1,0 +1,51 @@
+﻿==========================================================================
+  ARK Config Creator v1.0.1 — PRIVACY
+==========================================================================
+
+Short version: ARK Config Creator has no servers, no accounts in the cloud,
+no analytics and no telemetry. Nothing about you or your configuration is ever
+sent to the makers of this Software.
+
+WHAT IS STORED, AND WHERE
+   Desktop app: your account and its settings are stored in a local database
+   on your PC, under
+       %APPDATA%\ARK Config Creator\arkcc-data
+   Browser version: settings are stored in that browser's local storage.
+
+   Account passwords are never stored in readable form. They are hashed with
+   scrypt using a random per-account salt.
+
+   Server connection details (hosting provider API tokens, panel URLs, chosen
+   local folders) are stored only on this PC. The local server service also
+   stores a random loopback-only access token on this PC so the app can
+   reconnect to a running local server after it is reopened. They are deliberately excluded
+   from the profile files you can export and share, so sharing a setup never
+   leaks a token.
+
+NETWORK CONNECTIONS THE SOFTWARE MAKES
+   The Software only reaches the internet when a feature you use needs it:
+     - Mod browser and mod settings discovery: the public CurseForge widget
+       API (api.cfwidget.com) and mod thumbnails (forgecdn.net).
+     - "Search the mod page" / settings documents: the linked document, which
+       may be on Google Docs/Sheets, a MediaWiki site such as ark.wiki.gg, or
+       Pastebin.
+     - Local Server Setup: Valve's SteamCMD download and Steam content
+       delivery, only after you explicitly start an install or update.
+     - Deploy: only the hosting provider you configured (for example
+       api.nitrado.net or your own panel URL). Your API token is sent to that
+       provider, and to nobody else.
+   No connection is made in the background, on startup, or for any other
+   purpose. Everything else — every setting, every generated file — is
+   computed entirely on your own computer.
+
+LOCAL SERVER CONSOLE
+   When you start a local server from the Software, a small local background
+   service keeps the server process and its console pipes alive while the app
+   is closed. It listens only on 127.0.0.1 and requires the random local token
+   above. Console output is streamed only while an open app page is viewing
+   it; it is not uploaded, written to a log, or retained after the viewer
+   disconnects.
+
+REMOVING YOUR DATA
+   Uninstalling offers to delete the local data folder. You can also delete
+   %APPDATA%\ARK Config Creator at any time; the Software will start fresh.
