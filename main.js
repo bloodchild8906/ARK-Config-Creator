@@ -270,6 +270,85 @@ function compareVersions(left, right) {
   return 0;
 }
 
+/**
+ * Reads an executable's Authenticode signature via PowerShell.
+ *
+ * @param {string} file
+ * @returns {Promise<{ status: string, subject: string }>} `status` is
+ *   PowerShell's `SignatureStatus` (`Valid`, `NotSigned`, `HashMismatch`, …),
+ *   or `Unknown` when the check itself could not run.
+ */
+function authenticodeSignature(file) {
+  const command = "$s = Get-AuthenticodeSignature -LiteralPath '" + psLiteral(file) + "';"
+    + " Write-Output $s.Status; Write-Output $s.SignerCertificate.Subject";
+  return new Promise((resolve) => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true });
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    // A failure to run the check must never be reported as "signed" — it falls
+    // through to Unknown, which the caller treats as unverified.
+    child.on('error', () => resolve({ status: 'Unknown', subject: '' }));
+    child.on('close', () => {
+      const [status = '', subject = ''] = output.split(/\r?\n/).map((line) => line.trim());
+      resolve({ status: status || 'Unknown', subject });
+    });
+  });
+}
+
+/**
+ * Decides whether a chosen installer may be executed.
+ *
+ * The update flow runs a `.exe` the user picked off disk, so a file merely
+ * *named* `ARK-Config-Creator-Setup-9.9.9.exe` sitting in Downloads used to be
+ * launched with no further checks.
+ *
+ * Releases are not code-signed today, so demanding a valid signature outright
+ * would break every legitimate update. Instead the running app is used as the
+ * trust anchor:
+ *
+ *   • If this build is signed, the installer must carry a valid signature from
+ *     the same publisher. Anything else is refused.
+ *   • If this build is unsigned there is nothing to compare against, so the
+ *     user is asked to confirm in a dialog naming the exact file.
+ *
+ * @returns {Promise<boolean>} false when the user declined.
+ */
+async function confirmInstallerIsTrusted(parentWindow, installer) {
+  const [running, candidate] = await Promise.all([
+    authenticodeSignature(process.execPath),
+    authenticodeSignature(installer),
+  ]);
+
+  if (running.status === 'Valid') {
+    if (candidate.status !== 'Valid') {
+      throw new AppError(
+        'That installer is not digitally signed (' + candidate.status + '), but this copy of '
+        + 'ARK Config Creator is. Download the installer again from the official releases page.',
+        'installer-unsigned');
+    }
+    if (candidate.subject !== running.subject) {
+      throw new AppError(
+        'That installer is signed by a different publisher than this copy of ARK Config Creator. '
+        + 'Download the installer again from the official releases page.',
+        'installer-publisher-mismatch');
+    }
+    return true;
+  }
+
+  const { response } = await dialog.showMessageBox(parentWindow, {
+    type: 'warning',
+    title: 'Run this installer?',
+    message: 'ARK Config Creator is about to run an installer it cannot verify.',
+    detail: 'This build is not code-signed, so the publisher of the selected file cannot be checked.\n\n'
+      + installer + '\n\nOnly continue if you downloaded this file yourself from the official releases page.',
+    buttons: ['Cancel', 'Run installer'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
 async function launchInstallerUpdate(webContents) {
   if (process.platform !== 'win32') {
     throw new AppError('In-place updates are currently available on Windows only.', 'unsupported-platform');
@@ -290,6 +369,8 @@ async function launchInstallerUpdate(webContents) {
   if (compareVersions(match[1], app.getVersion()) <= 0) {
     throw new AppError('Select a newer installer than version ' + app.getVersion() + '.', 'installer-not-newer');
   }
+  const trusted = await confirmInstallerIsTrusted(BrowserWindow.fromWebContents(webContents), installer);
+  if (!trusted) return { canceled: true };
   await new Promise((resolve, reject) => {
     const child = spawn(installer, [], { detached: true, windowsHide: false, stdio: 'ignore' });
     child.once('error', reject);

@@ -112,6 +112,8 @@ HOW TO USE IT
        - watch a live console; the game server keeps running if you close the
          app, and reopening the app reconnects to new output (old output is
          not kept)
+       - use "Stop server" on the console card when you actually want the
+         server to end — closing the app on its own will not stop it
      This local installer is available in the Windows desktop app. The
      browser version can still create/download files, but cannot install
      or launch a server. Remote-machine provisioning is planned separately;
@@ -150,7 +152,9 @@ TIPS
   - "Show only settings I changed" gives a quick overview
     of everything you've customized.
   - Save your whole setup as a .json profile (in Presets)
-    to back it up or share it with a friend.
+    to back it up or share it with a friend. Passwords, RCON
+    settings and local folder paths are left out of that file
+    on purpose, so it is safe to share.
   - Always keep a backup of your old .ini files before
     replacing them.
 

@@ -10,8 +10,8 @@ ARK Config Creator is a Windows desktop app for creating and deploying ARK: Surv
 - Provides plain-language server settings, presets, launch options, mod controls, and import/export.
 - Installs, configures, and launches a local ASA dedicated server in one guided action.
 - Connects to Nitrado and Pterodactyl/WISP servers to read and deploy configuration.
-- Keeps a live local-server console available after the app is reopened. Console output is intentionally discarded while nobody is viewing it.
-- Updates the desktop app in place from a newer installer—no uninstall required.
+- Keeps a live local-server console available after the app is reopened, with a Stop control for ending the server. Console output is intentionally discarded while nobody is viewing it.
+- Updates the desktop app in place from a newer installer—no uninstall required, and the installer's publisher is checked first.
 
 ## Install or update
 

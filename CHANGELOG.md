@@ -64,6 +64,12 @@ established.
 - **`shell.openPath` could execute a file.** "Open folder" resolved a path from
   renderer state without checking it was a directory. It now refuses anything
   else.
+- **The in-place updater ran any chosen `.exe` unverified.** A file merely
+  *named* `ARK-Config-Creator-Setup-9.9.9.exe` was launched on the strength of
+  its filename and version alone. The running app is now used as the trust
+  anchor: a signed build refuses an installer that is unsigned or signed by a
+  different publisher, and an unsigned build asks for explicit confirmation
+  naming the exact file.
 - Added a Content-Security-Policy and enabled the renderer `sandbox`. IPC
   handlers now reject anything that did not come from the app's own top-level
   frame.
