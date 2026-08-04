@@ -248,6 +248,46 @@ function friendlyKeyName(key) {
   return k.trim();
 }
 
+/* Type/default/description inference for one documented setting.
+   This is the single implementation: the INI-block parser and the
+   spreadsheet/table parser both feed into it, so "1.5", "True" or a
+   "true/false" comment is typed identically whichever document it came from.
+
+   @param {string} key   the setting name as written in the doc
+   @param {string} val   the value as written (may be empty — docs often omit it)
+   @param {string} desc  the annotation next to it (may be empty)
+   @returns {{k:string,t:'bool'|'int'|'float'|'str',d:*,n:string,h:string}}
+ */
+function inferSetting(key, val, desc) {
+  let t = 'str';
+  let d = null;
+  val = String(val || '').trim();
+  desc = String(desc || '').trim();
+  if (val === '') {
+    // no value documented: guess the type from the wording of the comment
+    const low = desc.toLowerCase();
+    if (low.includes('true') && low.includes('false')) t = 'bool';
+    else if (/\b(number|amount|seconds|radius|limit|id|%|range)\b/.test(low)) t = 'int';
+  } else if (/^(true|false)$/i.test(val)) { t = 'bool'; d = /^true$/i.test(val); }
+  else if (/^-?\d+$/.test(val)) { t = 'int'; d = parseInt(val, 10); }
+  else if (/^-?\d*\.\d+$/.test(val)) { t = 'float'; d = parseFloat(val); }
+  else { t = 'str'; d = val; }
+  if (desc) {
+    desc = desc.charAt(0).toUpperCase() + desc.slice(1);
+    if (!/[.!?)]$/.test(desc)) desc += '.';
+  }
+  return { k: key, t, d, n: friendlyKeyName(key), h: desc };
+}
+
+/* Mod docs annotate a value either as "value (comment)" or "value - comment". */
+function splitValueAndDescription(rest) {
+  const paren = rest.match(/^([^(]*?)\s*\((.*)\)\s*$/);
+  if (paren) return { val: paren[1].trim(), desc: paren[2].trim() };
+  const dash = rest.indexOf(' - ');
+  if (dash >= 0) return { val: rest.slice(0, dash).trim(), desc: rest.slice(dash + 3).trim() };
+  return { val: rest, desc: '' };
+}
+
 /* Parses an INI-ish text block (with "( comment )" / " - comment" annotations)
    into [{file, section, settings:[{k,t,d,n,h}]}]. */
 function parseIniAnnotated(text, file) {
@@ -272,31 +312,8 @@ function parseIniAnnotated(text, file) {
     if (eq <= 0) continue;
     const key = line.slice(0, eq).trim();
     if (!/^[A-Za-z][\w\[\]]*$/.test(key)) continue;
-    let rest = line.slice(eq + 1).trim();
-    let desc = '';
-    let val = rest;
-    const mPar = rest.match(/^([^(]*?)\s*\((.*)\)\s*$/);
-    if (mPar) { val = mPar[1].trim(); desc = mPar[2].trim(); }
-    else if (rest.includes(' - ')) {
-      const i = rest.indexOf(' - ');
-      val = rest.slice(0, i).trim(); desc = rest.slice(i + 3).trim();
-    }
-    let t = 'str';
-    let d = null;
-    if (val === '') {
-      const low = desc.toLowerCase();
-      if (low.includes('true') && low.includes('false')) t = 'bool';
-      else if (/\b(number|amount|seconds|radius|limit|id|%|range)\b/.test(low)) t = 'int';
-      d = null;
-    } else if (/^(true|false)$/i.test(val)) { t = 'bool'; d = /^true$/i.test(val); }
-    else if (/^-?\d+$/.test(val)) { t = 'int'; d = parseInt(val, 10); }
-    else if (/^-?\d*\.\d+$/.test(val)) { t = 'float'; d = parseFloat(val); }
-    else { t = 'str'; d = val; }
-    if (desc) {
-      desc = desc.charAt(0).toUpperCase() + desc.slice(1);
-      if (!/[.!?)]$/.test(desc)) desc += '.';
-    }
-    cur.settings.push({ k: key, t, d, n: friendlyKeyName(key), h: desc });
+    const { val, desc } = splitValueAndDescription(line.slice(eq + 1).trim());
+    cur.settings.push(inferSetting(key, val, desc));
   }
   return sections.filter((s) => s.settings.length);
 }
@@ -407,27 +424,6 @@ function extractDocLinks(html) {
   return links;
 }
 
-/* shared type/default/description inference for one setting */
-function inferSetting(key, val, desc) {
-  let t = 'str';
-  let d = null;
-  val = String(val || '').trim();
-  desc = String(desc || '').trim();
-  if (val === '') {
-    const low = desc.toLowerCase();
-    if (low.includes('true') && low.includes('false')) t = 'bool';
-    else if (/\b(number|amount|seconds|radius|limit|id|%|range)\b/.test(low)) t = 'int';
-  } else if (/^(true|false)$/i.test(val)) { t = 'bool'; d = /^true$/i.test(val); }
-  else if (/^-?\d+$/.test(val)) { t = 'int'; d = parseInt(val, 10); }
-  else if (/^-?\d*\.\d+$/.test(val)) { t = 'float'; d = parseFloat(val); }
-  else { t = 'str'; d = val; }
-  if (desc) {
-    desc = desc.charAt(0).toUpperCase() + desc.slice(1);
-    if (!/[.!?)]$/.test(desc)) desc += '.';
-  }
-  return { k: key, t, d, n: friendlyKeyName(key), h: desc };
-}
-
 /* split one CSV/TSV line into cells (handles quoted CSV cells) */
 function splitRow(line) {
   if (line.includes('\t')) return line.split('\t').map((c) => c.trim());
@@ -524,68 +520,129 @@ function wikitextToLines(wt) {
 
 const DOC_TEXT_LIMIT = 500000;
 const DOC_SETTINGS_CAP = 200;   // a huge wiki page must not flood a mod with junk settings
-const NOTHING = { sections: [], text: '' };
 
-/* Fetches the raw text behind a settings-doc link (empty string if the link
-   kind can't be read cross-origin). */
+/* Why a settings doc produced nothing. The old code collapsed every one of
+   these into a single empty sentinel, so a dead network, a 404, a Google Doc
+   that needs a login and a page full of prose all told the user the exact same
+   thing ("could not find any settings"). */
+const DOC_STATUS = {
+  OK: 'ok',                     // settings were parsed out of it
+  UNSUPPORTED: 'unsupported',   // a link kind we cannot read from the browser at all
+  UNREACHABLE: 'unreachable',   // network/HTTP/permission failure — we never saw the text
+  UNREADABLE: 'unreadable',     // we got a response but it was not the format we expect
+  TOO_LARGE: 'too-large',       // guard against pulling a whole wiki into memory
+  NOTHING: 'nothing',           // read fine, but nothing in it looks like a setting
+};
+
+/** A parsed doc that yielded no settings, tagged with the reason why. */
+function docFailure(status) { return { status, sections: [], text: '' }; }
+
+/* Thrown by fetchDocText so the caller can tell *why* a doc could not be read
+   instead of guessing from an empty string. */
+class DocFetchError extends Error {
+  constructor(status, message) {
+    super(message || status);
+    this.name = 'DocFetchError';
+    this.status = status;
+  }
+}
+
+/** Fetches a URL as text, mapping network and HTTP failures onto DOC_STATUS. */
+async function fetchDocResponseText(url) {
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (e) {
+    throw new DocFetchError(DOC_STATUS.UNREACHABLE, e.message || 'network error');
+  }
+  if (!response.ok) throw new DocFetchError(DOC_STATUS.UNREACHABLE, 'HTTP ' + response.status);
+  return response.text();
+}
+
+/* Fetches the raw text behind a settings-doc link.
+   Throws DocFetchError when the link cannot be read. */
 async function fetchDocText(link) {
   if (link.kind === 'gsheet') {
     const id = (link.url.match(/spreadsheets\/d\/([A-Za-z0-9_-]{20,})/) || [])[1];
-    if (!id) return '';
-    const r = await fetch(`https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv`);
-    return r.ok ? r.text() : '';
+    if (!id) throw new DocFetchError(DOC_STATUS.UNSUPPORTED, 'no spreadsheet id in the link');
+    return fetchDocResponseText(`https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv`);
   }
   if (link.kind === 'gdoc') {
     const id = (link.url.match(/document\/d\/([A-Za-z0-9_-]{20,})/) || [])[1];
-    if (!id) return '';
-    const r = await fetch(`https://docs.google.com/document/d/${id}/export?format=txt`);
-    return r.ok ? r.text() : '';
+    if (!id) throw new DocFetchError(DOC_STATUS.UNSUPPORTED, 'no document id in the link');
+    return fetchDocResponseText(`https://docs.google.com/document/d/${id}/export?format=txt`);
   }
   if (link.kind === 'paste') {
     const id = (link.url.match(/pastebin\.com\/(?:raw\/)?(\w+)/) || [])[1];
-    if (!id) return '';
-    const r = await fetch(`https://pastebin.com/raw/${id}`);
-    return r.ok ? r.text() : '';
+    if (!id) throw new DocFetchError(DOC_STATUS.UNSUPPORTED, 'no paste id in the link');
+    return fetchDocResponseText(`https://pastebin.com/raw/${id}`);
   }
   if (link.kind === 'mediawiki') {
     // the MediaWiki API supports cross-origin reads with origin=* (Fandom, wiki.gg, …)
     const m = link.url.match(/^(https?:\/\/[^\/]+)(?:\/[^\/]+)*?\/wiki\/([^?#]+)/i);
-    if (!m) return '';
-    const r = await fetch(`${m[1]}/api.php?action=parse&page=${encodeURIComponent(decodeURIComponent(m[2]))}&format=json&prop=wikitext&origin=*`);
-    if (!r.ok) return '';
-    const j = await r.json();
-    const wt = j && j.parse && j.parse.wikitext && j.parse.wikitext['*'];
-    return wt ? wikitextToLines(wt) : '';
+    if (!m) throw new DocFetchError(DOC_STATUS.UNSUPPORTED, 'not a /wiki/ article URL');
+    const raw = await fetchDocResponseText(
+      `${m[1]}/api.php?action=parse&page=${encodeURIComponent(decodeURIComponent(m[2]))}&format=json&prop=wikitext&origin=*`
+    );
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (e) { throw new DocFetchError(DOC_STATUS.UNREADABLE, 'the wiki API did not return JSON'); }
+    const wikitext = parsed && parsed.parse && parsed.parse.wikitext && parsed.parse.wikitext['*'];
+    if (!wikitext) throw new DocFetchError(DOC_STATUS.UNREADABLE, 'the wiki API returned no article text');
+    return wikitextToLines(wikitext);
   }
-  return '';   // generic pages: CORS almost always blocks — handled via the paste fallback
+  // generic pages: CORS almost always blocks — handled via the paste-it-yourself fallback
+  throw new DocFetchError(DOC_STATUS.UNSUPPORTED, 'not a source we can read from here');
 }
 
-/* Reads a settings-doc link and parses it. Returns { sections, text } so the
-   caller can also scan the raw text for modded content. */
+/**
+ * Reads a settings-doc link and parses it.
+ *
+ * @returns {{ status: string, sections: Array, text: string }} `status` is a
+ *   DOC_STATUS value so the caller can tell the user whether the doc could not
+ *   be reached, is not a supported source, or simply had nothing in it.
+ */
 async function tryFetchDocSettings(link, file, fallbackSection) {
+  let text;
   try {
-    const text = await fetchDocText(link);
-    if (!text || text.length > DOC_TEXT_LIMIT) return NOTHING;
+    text = await fetchDocText(link);
+  } catch (e) {
+    return docFailure(e instanceof DocFetchError ? e.status : DOC_STATUS.UNREADABLE);
+  }
+  if (!text) return docFailure(DOC_STATUS.NOTHING);
+  if (text.length > DOC_TEXT_LIMIT) return docFailure(DOC_STATUS.TOO_LARGE);
 
-    // run both parsers and combine — docs often mix INI blocks with tables
-    const sections = parseIniAnnotated(text, file);
-    for (const ss of parseSheetText(text, file, fallbackSection)) {
-      const target = sections.find((s) => s.section.toLowerCase() === ss.section.toLowerCase());
-      if (!target) { sections.push(ss); continue; }
-      for (const st of ss.settings) {
-        if (!target.settings.some((x) => x.k.toLowerCase() === st.k.toLowerCase())) target.settings.push(st);
-      }
+  // run both parsers and combine — docs often mix INI blocks with tables
+  const sections = parseIniAnnotated(text, file);
+  for (const ss of parseSheetText(text, file, fallbackSection)) {
+    const target = sections.find((s) => s.section.toLowerCase() === ss.section.toLowerCase());
+    if (!target) { sections.push(ss); continue; }
+    for (const st of ss.settings) {
+      if (!target.settings.some((x) => x.k.toLowerCase() === st.k.toLowerCase())) target.settings.push(st);
     }
-    let total = 0;
-    const capped = [];
-    for (const s of sections) {
-      if (total >= DOC_SETTINGS_CAP) break;
-      const take = s.settings.slice(0, DOC_SETTINGS_CAP - total);
-      total += take.length;
-      capped.push({ ...s, settings: take });
-    }
-    return { sections: capped, text };
-  } catch (e) { return NOTHING; }
+  }
+  let total = 0;
+  const capped = [];
+  for (const s of sections) {
+    if (total >= DOC_SETTINGS_CAP) break;
+    const take = s.settings.slice(0, DOC_SETTINGS_CAP - total);
+    total += take.length;
+    capped.push({ ...s, settings: take });
+  }
+  // the raw text is still useful even with no settings — it names the mod's
+  // own creatures and items, which the content scanner picks up
+  return { status: capped.length ? DOC_STATUS.OK : DOC_STATUS.NOTHING, sections: capped, text };
+}
+
+/** One short, human sentence explaining a non-OK DOC_STATUS. */
+function docStatusMessage(status, label) {
+  const what = label ? `“${label}”` : 'that doc';
+  switch (status) {
+    case DOC_STATUS.UNREACHABLE: return `Could not reach ${what} — it may be offline, private, or need a login.`;
+    case DOC_STATUS.UNSUPPORTED: return `${what} is not a source this tool can read — open it and paste the settings in below.`;
+    case DOC_STATUS.UNREADABLE: return `${what} answered, but not in a format this tool understands.`;
+    case DOC_STATUS.TOO_LARGE: return `${what} is too big to read here — open it and paste just the settings table in below.`;
+    default: return `${what} had nothing this tool recognises as settings.`;
+  }
 }
 
 /* merge parsed sections into a mod's runtime settings, skipping known keys.
@@ -624,21 +681,66 @@ function fallbackSectionFor(mod) {
 }
 
 /* ---------------- online settings discovery ---------------- */
+
+/** Why a CurseForge lookup failed. Callers branch on `code`, never on prose. */
+const CF_ERROR = {
+  QUEUED: 'queued',            // cfwidget is still building this project's data (HTTP 202)
+  UNREACHABLE: 'unreachable',  // no response at all — offline, DNS, blocked
+  HTTP: 'http',                // the service answered with an error status
+  MALFORMED: 'malformed',      // answered, but not with the JSON we expect
+};
+
+/* The failure reason used to be smuggled inside the *display* message, so
+   rewording a toast would silently change control flow. It travels as a code
+   now; `message` is free to be human-readable. */
+class CurseForgeError extends Error {
+  constructor(code, message) {
+    super(message || code);
+    this.name = 'CurseForgeError';
+    this.code = code;
+  }
+}
+
+const CF_LOOKUP_ATTEMPTS = 3;
+
 async function fetchCfwidget(idOrPath) {
   const url = 'https://api.cfwidget.com/' + idOrPath;
   let queued = false;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const r = await fetch(url);
+  for (let attempt = 0; attempt < CF_LOOKUP_ATTEMPTS; attempt++) {
+    let r;
+    try {
+      r = await fetch(url);
+    } catch (e) {
+      throw new CurseForgeError(CF_ERROR.UNREACHABLE, e.message || 'network error');
+    }
     if (r.status === 202) {
+      // 202 = "come back in a moment", not a failure: retry a couple of times
       queued = true;
-      if (attempt < 2) await new Promise((res) => setTimeout(res, 2500));
+      if (attempt < CF_LOOKUP_ATTEMPTS - 1) await new Promise((res) => setTimeout(res, APP_TIMEOUTS.CURSEFORGE_RETRY_MS));
       continue;
     }
     queued = false;
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return await r.json();
+    if (!r.ok) throw new CurseForgeError(CF_ERROR.HTTP, 'HTTP ' + r.status);
+    try {
+      return await r.json();
+    } catch (e) {
+      throw new CurseForgeError(CF_ERROR.MALFORMED, 'CurseForge sent something that is not JSON');
+    }
   }
-  throw new Error(queued ? 'queued' : 'unreachable');
+  throw new CurseForgeError(queued ? CF_ERROR.QUEUED : CF_ERROR.UNREACHABLE, 'no usable answer from CurseForge');
+}
+
+/** True when `error` is a CurseForge failure of the given code. */
+function isCfError(error, code) {
+  return Boolean(error) && error.code === code;
+}
+
+/** The sentence to show the user for a failed CurseForge lookup. */
+function cfErrorMessage(error) {
+  if (isCfError(error, CF_ERROR.QUEUED)) return 'CurseForge is still preparing this mod’s info — try again in a minute.';
+  if (isCfError(error, CF_ERROR.HTTP)) return 'CurseForge could not give us this mod (' + error.message + ') — check the ID or URL.';
+  if (isCfError(error, CF_ERROR.MALFORMED)) return 'CurseForge answered with something this tool could not read — try again shortly.';
+  return 'Could not reach CurseForge right now (offline?).';
 }
 
 /* Looks at the mod's CurseForge page (and any settings docs it links, like
@@ -651,11 +753,7 @@ async function discoverModSettings(modId, opts = {}) {
   let j = opts.data || null;
   if (!j) {
     try { j = await fetchCfwidget(modId); } catch (e) {
-      if (!opts.silent) {
-        toast(String(e.message) === 'queued'
-          ? 'CurseForge is still preparing this mod’s info — try again in a minute.'
-          : 'Could not reach CurseForge right now (offline?).');
-      }
+      if (!opts.silent) toast(cfErrorMessage(e));
       return -1;
     }
   }
@@ -674,6 +772,7 @@ async function discoverModSettings(modId, opts = {}) {
 
   // 2) settings docs linked from the page (Google Sheets/Docs, pastebin, wikis)
   const links = extractDocLinks(desc);
+  const docFailures = [];
   if (links.length) {
     if (!state.modDocs) state.modDocs = {};
     state.modDocs[modId] = links;
@@ -685,6 +784,8 @@ async function discoverModSettings(modId, opts = {}) {
       if (doc.sections.length) {
         const n = mergeDynSections(modId, doc.sections);
         if (n) { added += n; link.autoRead = true; saveState(); }
+      } else {
+        docFailures.push({ status: doc.status, label: link.label || link.url });
       }
     }
   }
@@ -693,13 +794,26 @@ async function discoverModSettings(modId, opts = {}) {
   }
 
   if (currentCat === 'mod:' + modId || currentCat === 'mods') render();
-  if (!opts.silent) {
-    if (added > 0) toast(`Found ${added} setting${added === 1 ? '' : 's'} for this mod online!`);
-    else if (links.length) toast('This mod documents its settings in a linked doc — open it below and paste the settings in.');
-    else if (block) toast('All of this mod’s documented settings are already here.');
-    else toast('No INI settings documented on this mod’s page.');
-  }
+  if (!opts.silent) reportDiscoveryOutcome({ added, links, docFailures, hasBlock: Boolean(block) });
   return added;
+}
+
+/* The end-of-discovery toast. Kept apart from the pipeline above because the
+   wording is the only part of it that users ever see, and it must say *which*
+   of the several possible nothing-happened cases actually occurred. */
+function reportDiscoveryOutcome({ added, links, docFailures, hasBlock }) {
+  if (added > 0) { toast(`Found ${added} setting${added === 1 ? '' : 's'} for this mod online!`); return; }
+  if (docFailures.length) {
+    // report the most actionable failure: an unreachable doc is a different
+    // problem from a doc we simply cannot parse
+    const order = [DOC_STATUS.UNREACHABLE, DOC_STATUS.TOO_LARGE, DOC_STATUS.UNREADABLE, DOC_STATUS.UNSUPPORTED, DOC_STATUS.NOTHING];
+    const worst = docFailures.slice().sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status))[0];
+    toast(docStatusMessage(worst.status, worst.label));
+    return;
+  }
+  if (links.length) { toast('This mod documents its settings in a linked doc — open it below and paste the settings in.'); return; }
+  if (hasBlock) { toast('All of this mod’s documented settings are already here.'); return; }
+  toast('No INI settings documented on this mod’s page.');
 }
 
 /* If Extra INI lines contain Key=Value pairs that are now real settings,
@@ -744,20 +858,73 @@ function migrateExtraLinesToSettings(modId) {
   else delete state.modExtra[modId];
 }
 
+/* ---------------- category icons, thumbnails, links ---------------- */
+
+/* MOD_CATS[*].icon in mods-db.js holds an *emoji*, but uiIcon() only resolves
+   names from ICON_PATHS and silently falls back to the generic info circle —
+   so every mod category used to render the same icon. mods-db.js is shared and
+   must not change, so the catalog's category ids are mapped to real icon names
+   here instead. app.js maps the same ids for the sidebar. */
+const MOD_CAT_ICON_NAMES = {
+  qol: 'sparkles',
+  structures: 'blocks',
+  dinos: 'dino',
+  maps: 'map',
+  stacking: 'pack',
+  utility: 'gear',
+  overhaul: 'gamepad',
+  admin: 'shield',
+  cosmetics: 'palette',
+  other: 'puzzle',
+};
+const MOD_CAT_ICON_FALLBACK = 'puzzle';
+
+/**
+ * The ICON_PATHS name to draw for a mod category id.
+ * @param {string} cat a MOD_CATS key (unknown/missing ids fall back to 'puzzle')
+ */
+function modCatIconName(cat) {
+  return MOD_CAT_ICON_NAMES[cat] || MOD_CAT_ICON_FALLBACK;
+}
+
+/** `{ name, iconName }` for a mod's category, with the catalog's own fallback. */
+function modCatInfo(cat) {
+  const entry = MOD_CATS[cat] || MOD_CATS.other;
+  return { name: entry.name, iconName: modCatIconName(MOD_CATS[cat] ? cat : 'other') };
+}
+
+/**
+ * The mod's square thumbnail, or the category icon when it has none.
+ * The inline `onerror` swaps a broken image for the same category icon; it is
+ * a string because the markup is built by concatenation before it is parsed.
+ */
+function modThumbMarkup(mod, size = 26) {
+  const iconName = modCatInfo(mod.cat).iconName;
+  if (!mod.thumb) return `<div class="mod-thumb mod-thumb-fallback">${uiIcon(iconName, size)}</div>`;
+  return `<img class="mod-thumb" src="${esc(mod.thumb)}" alt="" loading="lazy" data-fallback-ic="${esc(iconName)}"`
+    + ` data-fallback-size="${size}"`
+    + ` onerror="this.outerHTML='&lt;div class=&quot;mod-thumb mod-thumb-fallback&quot;&gt;'+uiIcon(this.dataset.fallbackIc,parseInt(this.dataset.fallbackSize,10))+'&lt;/div&gt;'">`;
+}
+
+/** Public CurseForge page for a mod (by slug when we know it, else by id). */
+function modCurseforgeUrl(mod) {
+  return mod.slug
+    ? `https://www.curseforge.com/ark-survival-ascended/mods/${mod.slug}`
+    : `https://www.curseforge.com/projects/${mod.id}`;
+}
+
 /* ---------------- shared card builders ---------------- */
 function makeModHeaderCard(mod, idx, total, opts = {}) {
   const head = document.createElement('div');
   head.className = 'opt-card wide selected-mod-row';
-  const catInfo = MOD_CATS[mod.cat] || MOD_CATS.other;
-  const thumbHtml = mod.thumb
-    ? `<img class="mod-thumb" src="${esc(mod.thumb)}" alt="" loading="lazy" data-fallback-ic="${catInfo.icon}" onerror="this.outerHTML='<div class=&quot;mod-thumb mod-thumb-fallback&quot;>'+uiIcon(this.dataset.fallbackIc,26)+'</div>'">`
-    : `<div class="mod-thumb mod-thumb-fallback">${uiIcon(catInfo.icon, 26)}</div>`;
+  const catInfo = modCatInfo(mod.cat);
+  const thumbHtml = modThumbMarkup(mod);
   const nIni = iniCount(mod);
-  const cfUrl = mod.slug ? `https://www.curseforge.com/ark-survival-ascended/mods/${mod.slug}` : `https://www.curseforge.com/projects/${mod.id}`;
+  const cfUrl = modCurseforgeUrl(mod);
   head.innerHTML = `
     ${thumbHtml}
     <div style="flex:1;min-width:0">
-      <div class="opt-name">${esc(mod.name)} <span class="mod-badge">${uiIcon(catInfo.icon, 12)} ${catInfo.name}</span>
+      <div class="opt-name">${esc(mod.name)} <span class="mod-badge">${uiIcon(catInfo.iconName, 12)} ${esc(catInfo.name)}</span>
         ${nIni ? `<span class="mod-badge has-ini">${uiIcon('gear', 12)} ${nIni} settings</span>` : ''}
         ${mod.mapName ? `<span class="mod-badge">${uiIcon('map', 12)} map: ${esc(mod.mapName)}</span>` : ''}</div>
       <code class="opt-key">ID ${esc(mod.id)}${mod.author ? ' · by ' + esc(mod.author) : ''} · <a href="${esc(cfUrl)}" target="_blank" rel="noopener" style="color:var(--accent)">View on CurseForge ↗</a></code>
@@ -765,29 +932,22 @@ function makeModHeaderCard(mod, idx, total, opts = {}) {
     </div>
     <div class="mod-row-btns"></div>`;
   const btns = head.querySelector('.mod-row-btns');
-  const mk = (label, title, fn, disabled) => {
-    const b = document.createElement('button');
-    b.className = 'btn small';
-    b.innerHTML = label;
-    b.title = title;
-    if (disabled) b.disabled = true;
-    b.addEventListener('click', fn);
-    btns.appendChild(b);
-  };
-  if (opts.withSettingsLink && iniCount(mod)) {
-    const b = document.createElement('button');
-    b.className = 'btn small primary';
-    b.innerHTML = uiIcon('gear', 14) + ' Settings';
-    b.addEventListener('click', () => { currentCat = 'mod:' + mod.id; render(); });
-    btns.appendChild(b);
-  } else if (opts.withSettingsLink) {
-    mk(uiIcon('filetext', 14) + ' Page', 'Open this mod’s page', () => { currentCat = 'mod:' + mod.id; render(); });
+  const openModPage = () => { currentCat = 'mod:' + mod.id; render(); };
+  if (opts.withSettingsLink) {
+    const hasSettings = Boolean(nIni);
+    uiButton(btns, {
+      small: true,
+      variant: hasSettings ? 'primary' : '',
+      html: hasSettings ? uiIcon('gear', 14) + ' Settings' : uiIcon('filetext', 14) + ' Page',
+      title: hasSettings ? 'Open this mod’s settings' : 'Open this mod’s page',
+      onClick: openModPage,
+    });
   }
   if (opts.withReorder) {
-    mk(uiIcon('up', 14), 'Load earlier', () => moveMod(mod.id, -1), idx === 0);
-    mk(uiIcon('down', 14), 'Load later', () => moveMod(mod.id, 1), idx === total - 1);
+    uiButton(btns, { small: true, html: uiIcon('up', 14), title: 'Load earlier', disabled: idx === 0, onClick: () => moveMod(mod.id, -1) });
+    uiButton(btns, { small: true, html: uiIcon('down', 14), title: 'Load later', disabled: idx === total - 1, onClick: () => moveMod(mod.id, 1) });
   }
-  mk(uiIcon('x', 14), 'Remove mod', () => removeMod(mod.id));
+  uiButton(btns, { small: true, html: uiIcon('x', 14), title: 'Remove mod', onClick: () => removeMod(mod.id) });
   return head;
 }
 
@@ -826,38 +986,64 @@ function makeModExtraCard(mod) {
 
 function iniCount(m) { return (m.ini || []).reduce((n, s) => n + s.settings.length, 0); }
 
-/* ---------------- per-mod page ---------------- */
+/* ---------------- per-mod page ----------------
+   renderModPage is deliberately only an orchestrator: each card below builds
+   itself, so a change to one card cannot disturb the others. */
 function renderModPage(grid, modId) {
   const entry = selectedMods().find((m) => m.id === modId);
   if (!entry) { currentCat = 'mods'; render(); return; }
   const mod = modInfo(entry);
   const idx = selectedMods().findIndex((m) => m.id === modId);
 
-  const headEl = $('catHeader');
-  headEl.innerHTML = `<h2><span class="h2ic">${uiIcon('puzzle', 22)}</span> ${esc(mod.name)}</h2><p>This mod's own settings page. Values you set here are written into the config files under the mod's section${mod.src ? ` — documented at <a href="${esc(mod.src)}" target="_blank" rel="noopener" style="color:var(--accent)">the mod page ↗</a>` : ''}.</p>`;
-
+  paintModPageHeader(mod);
   grid.appendChild(makeModHeaderCard(mod, idx, selectedMods().length, { withReorder: true }));
 
-  if (mod.mapName) {
-    const note = document.createElement('div');
-    note.className = 'hint-box';
-    note.style.gridColumn = '1 / -1';
-    note.innerHTML = `${uiIcon('map', 14)} This is a <b>map mod</b>. To play it, also set Map to “Custom / Mod Map…” with the name <code>${esc(mod.mapName)}</code> in 🚀 Launch Options.`;
-    const useBtn = document.createElement('button');
-    useBtn.className = 'btn small';
-    useBtn.style.marginLeft = '10px';
-    useBtn.textContent = 'Use as my map';
-    useBtn.addEventListener('click', () => {
+  const mapNote = makeMapModNote(mod);
+  if (mapNote) grid.appendChild(mapNote);
+
+  const nSettings = appendModSettingCards(grid, mod);
+  grid.appendChild(makeFindSettingsCard(mod, nSettings));
+
+  const docsCard = makeModDocsCard(mod);
+  if (docsCard) grid.appendChild(docsCard);
+
+  grid.appendChild(makeModExtraCard(mod));
+  grid.appendChild(makeBackToModsButton());
+}
+
+/* the page title above the grid */
+function paintModPageHeader(mod) {
+  const documented = mod.src
+    ? ` — documented at <a href="${esc(mod.src)}" target="_blank" rel="noopener" style="color:var(--accent)">the mod page ↗</a>`
+    : '';
+  $('catHeader').innerHTML = `<h2><span class="h2ic">${uiIcon('puzzle', 22)}</span> ${esc(mod.name)}</h2>`
+    + `<p>This mod's own settings page. Values you set here are written into the config files under the mod's section${documented}.</p>`;
+}
+
+/* Map mods need a launch-option change as well as the mod itself — say so, and
+   offer to make it. Returns null for ordinary mods. */
+function makeMapModNote(mod) {
+  if (!mod.mapName) return null;
+  const note = document.createElement('div');
+  note.className = 'hint-box';
+  note.style.gridColumn = '1 / -1';
+  note.innerHTML = `${uiIcon('map', 14)} This is a <b>map mod</b>. To play it, also set Map to “Custom / Mod Map…” with the name <code>${esc(mod.mapName)}</code> in ${uiIcon('rocket', 14)} Launch Options.`;
+  const useBtn = uiButton(note, {
+    small: true,
+    text: 'Use as my map',
+    onClick: () => {
       state.launch.map = '__custom';
       state.launch.customMap = mod.mapName;
       saveState(); refreshBadges();
       toast(`Map set to ${mod.mapName} — check Launch Options.`);
-    });
-    note.appendChild(useBtn);
-    grid.appendChild(note);
-  }
+    },
+  });
+  useBtn.style.marginLeft = '10px';
+  return note;
+}
 
-  // settings cards
+/** Appends one control per known setting. @returns {number} how many. */
+function appendModSettingCards(grid, mod) {
   let nSettings = 0;
   for (const sec of (mod.ini || [])) {
     for (const s of sec.settings) {
@@ -865,11 +1051,14 @@ function renderModPage(grid, modId) {
       nSettings++;
     }
   }
+  return nSettings;
+}
 
-  // find-more-online card
-  const findCard = document.createElement('div');
-  findCard.className = 'opt-card wide';
-  findCard.innerHTML = `
+/* "read the CurseForge page live" card */
+function makeFindSettingsCard(mod, nSettings) {
+  const card = document.createElement('div');
+  card.className = 'opt-card wide';
+  card.innerHTML = `
     <div class="opt-head"><div>
       <div class="opt-name">${nSettings ? 'Look for more settings' : 'Find this mod’s settings'}</div>
       <code class="opt-key">reads the mod's CurseForge page live</code>
@@ -877,79 +1066,90 @@ function renderModPage(grid, modId) {
     <p class="opt-help">${nSettings
       ? 'Checks the mod’s CurseForge page for settings that aren’t listed here yet (mod authors add new ones over time).'
       : 'This mod has no settings in the bundled catalog. The tool can read its CurseForge page right now and turn any documented INI settings into controls.'}</p>`;
-  const findBtn = document.createElement('button');
-  findBtn.className = 'btn primary small';
-  findBtn.innerHTML = uiIcon('search', 15) + ' Search the mod page';
-  findBtn.style.alignSelf = 'flex-start';
-  findBtn.addEventListener('click', async () => {
-    findBtn.disabled = true;
-    findBtn.textContent = 'Reading mod page…';
-    await discoverModSettings(mod.id);
-    findBtn.disabled = false;
-    findBtn.innerHTML = uiIcon('search', 15) + ' Search the mod page';
+  const idleLabel = uiIcon('search', 15) + ' Search the mod page';
+  const findBtn = uiButton(card, {
+    small: true,
+    variant: 'primary',
+    html: idleLabel,
+    onClick: () => withBusyButton(findBtn, async () => {
+      findBtn.textContent = 'Reading mod page…';
+      try { await discoverModSettings(mod.id); } finally { findBtn.innerHTML = idleLabel; }
+    }),
   });
-  findCard.appendChild(findBtn);
-  grid.appendChild(findCard);
+  findBtn.style.alignSelf = 'flex-start';
+  return card;
+}
 
-  // settings docs linked from the mod page (e.g. Google Sheets)
+/* One button per settings doc found on the mod page, plus a paste box for the
+   docs we cannot read from here. Returns null when the mod links none. */
+function makeModDocsCard(mod) {
   const docs = (state.modDocs || {})[mod.id] || [];
-  if (docs.length) {
-    const docsCard = document.createElement('div');
-    docsCard.className = 'opt-card wide';
-    docsCard.innerHTML = `
-      <div class="opt-head"><div>
-        <div class="opt-name">This mod's settings documentation</div>
-        <code class="opt-key">links found on the mod's CurseForge page</code>
-      </div></div>
-      <p class="opt-help">The mod author documents settings in the doc${docs.length === 1 ? '' : 's'} below.
-      ${docs.some((d) => d.autoRead) ? 'Some were read automatically. ' : ''}Docs with several tabs can't always be read automatically —
-      open the doc, copy the settings table or INI block, and paste it here: the tool turns it into controls.
-      <b>Tip:</b> if the mod also exists for the old ARK (ASE), make sure the doc section you copy is for the ASA version.</p>`;
-    const linkRow = document.createElement('div');
-    linkRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
-    for (const d of docs) {
-      const a = document.createElement('a');
-      a.className = 'btn small';
-      a.href = d.url;
-      a.target = '_blank';
-      a.rel = 'noopener';
-      a.innerHTML = uiIcon(d.kind === 'gsheet' ? 'doc' : d.kind === 'gdoc' ? 'filetext' : d.kind === 'mediawiki' ? 'book' : 'link', 14) + ' ' + esc((d.label || d.url).slice(0, 46)) + ' ' + uiIcon(d.autoRead ? 'check' : 'external', 12);
-      linkRow.appendChild(a);
-    }
-    docsCard.appendChild(linkRow);
-    const ta = document.createElement('textarea');
-    ta.placeholder = 'Paste the settings from the doc here — INI lines or copied table rows both work…';
-    ta.style.cssText = 'width:100%;min-height:90px;resize:vertical;font-family:Consolas,monospace;font-size:.82rem;white-space:pre;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--bg2);outline:none;line-height:1.5;margin-top:8px';
-    docsCard.appendChild(ta);
-    const parseBtn = document.createElement('button');
-    parseBtn.className = 'btn small primary';
-    parseBtn.style.cssText = 'align-self:flex-start;margin-top:6px';
-    parseBtn.innerHTML = uiIcon('gear', 15) + ' Turn pasted text into settings';
-    parseBtn.addEventListener('click', () => {
-      const text = ta.value.trim();
-      if (!text) { toast('Paste the settings from the doc first.'); return; }
-      const fb = fallbackSectionFor(mod);
-      let parsed = parseIniAnnotated(text, 'gus');
-      if (!parsed.length) parsed = parseSheetText(text, 'gus', fb);
-      if (!parsed.length) { toast('Could not find any settings in the pasted text — make sure it contains the setting names and values.'); return; }
-      const n = mergeDynSections(mod.id, parsed);
-      if (n > 0) { toast(`Added ${n} setting${n === 1 ? '' : 's'} from the doc!`); render(); }
-      else toast('Those settings are already here.');
-    });
-    docsCard.appendChild(parseBtn);
-    grid.appendChild(docsCard);
+  if (!docs.length) return null;
+
+  const card = document.createElement('div');
+  card.className = 'opt-card wide';
+  card.innerHTML = `
+    <div class="opt-head"><div>
+      <div class="opt-name">This mod's settings documentation</div>
+      <code class="opt-key">links found on the mod's CurseForge page</code>
+    </div></div>
+    <p class="opt-help">The mod author documents settings in the doc${docs.length === 1 ? '' : 's'} below.
+    ${docs.some((d) => d.autoRead) ? 'Some were read automatically. ' : ''}Docs with several tabs can't always be read automatically —
+    open the doc, copy the settings table or INI block, and paste it here: the tool turns it into controls.
+    <b>Tip:</b> if the mod also exists for the old ARK (ASE), make sure the doc section you copy is for the ASA version.</p>`;
+
+  const linkRow = uiElement('div', { parent: card });
+  linkRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
+  for (const d of docs) {
+    const a = uiElement('a', { className: 'btn small', parent: linkRow });
+    a.href = d.url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.innerHTML = uiIcon(docLinkIconName(d.kind), 14) + ' ' + esc((d.label || d.url).slice(0, 46)) + ' ' + uiIcon(d.autoRead ? 'check' : 'external', 12);
   }
 
-  grid.appendChild(makeModExtraCard(mod));
+  const ta = document.createElement('textarea');
+  ta.placeholder = 'Paste the settings from the doc here — INI lines or copied table rows both work…';
+  ta.style.cssText = 'width:100%;min-height:90px;resize:vertical;font-family:Consolas,monospace;font-size:.82rem;white-space:pre;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--bg2);outline:none;line-height:1.5;margin-top:8px';
+  card.appendChild(ta);
 
-  // back link
-  const back = document.createElement('button');
-  back.className = 'btn';
+  const parseBtn = uiButton(card, {
+    small: true,
+    variant: 'primary',
+    html: uiIcon('gear', 15) + ' Turn pasted text into settings',
+    onClick: () => applyPastedDocSettings(mod, ta.value),
+  });
+  parseBtn.style.cssText = 'align-self:flex-start;margin-top:6px';
+  return card;
+}
+
+function docLinkIconName(kind) {
+  if (kind === 'gsheet') return 'doc';
+  if (kind === 'gdoc') return 'filetext';
+  if (kind === 'mediawiki') return 'book';
+  return 'link';
+}
+
+/* Turns text the user pasted out of a settings doc into real controls. */
+function applyPastedDocSettings(mod, raw) {
+  const text = String(raw || '').trim();
+  if (!text) { toast('Paste the settings from the doc first.'); return; }
+  let parsed = parseIniAnnotated(text, 'gus');
+  if (!parsed.length) parsed = parseSheetText(text, 'gus', fallbackSectionFor(mod));
+  if (!parsed.length) { toast('Could not find any settings in the pasted text — make sure it contains the setting names and values.'); return; }
+  const n = mergeDynSections(mod.id, parsed);
+  if (n > 0) { toast(`Added ${n} setting${n === 1 ? '' : 's'} from the doc!`); render(); }
+  else toast('Those settings are already here.');
+}
+
+function makeBackToModsButton() {
+  const back = uiButton(null, {
+    html: uiIcon('back', 15) + ' Back to all mods',
+    onClick: () => { currentCat = 'mods'; render(); },
+  });
   back.style.gridColumn = '1 / -1';
   back.style.justifySelf = 'start';
-  back.innerHTML = uiIcon('back', 15) + ' Back to all mods';
-  back.addEventListener('click', () => { currentCat = 'mods'; render(); });
-  grid.appendChild(back);
+  return back;
 }
 
 /* ---------------- Mods overview page ---------------- */
@@ -1001,10 +1201,11 @@ function renderModsCategory(grid) {
 }
 
 /* ---------------- Mod Browser modal ---------------- */
-let browserFilter = { term: '', cat: 'all', sort: 'dl' };
+const DEFAULT_BROWSER_FILTER = { term: '', cat: 'all', sort: 'dl' };
+let browserFilter = { ...DEFAULT_BROWSER_FILTER };
 
 function openModBrowser() {
-  browserFilter = { term: '', cat: 'all', sort: 'dl' };
+  browserFilter = { ...DEFAULT_BROWSER_FILTER };
   $('modSearch').value = '';
   $('modCatFilter').value = 'all';
   $('modSort').value = 'dl';
@@ -1036,107 +1237,141 @@ function renderModBrowser() {
     wrap.innerHTML = '<div class="empty-msg">No mods match. You can still add any CurseForge mod by ID below.</div>';
     return;
   }
-  for (const m of list) {
-    const nIni = iniCount(m);
-    const catInfo = MOD_CATS[m.cat] || MOD_CATS.other;
-    const card = document.createElement('div');
-    card.className = 'mod-card';
-    const cfUrl = m.slug ? `https://www.curseforge.com/ark-survival-ascended/mods/${m.slug}` : `https://www.curseforge.com/projects/${m.id}`;
-    const thumbHtml = m.thumb
-      ? `<img class="mod-thumb" src="${esc(m.thumb)}" alt="" loading="lazy" data-fallback-ic="${catInfo.icon}" onerror="this.outerHTML='<div class=&quot;mod-thumb mod-thumb-fallback&quot;>'+uiIcon(this.dataset.fallbackIc,26)+'</div>'">`
-      : `<div class="mod-thumb mod-thumb-fallback">${uiIcon(catInfo.icon, 26)}</div>`;
-    card.innerHTML = `
-      ${thumbHtml}
-      <div class="mod-card-body">
-        <div class="mod-card-title">${esc(m.name)}</div>
-        <div class="mod-card-meta">${catInfo.icon} ${catInfo.name}${m.dl ? ` · ${uiIcon('download', 11)} ${fmtDl(m.dl)}` : ''}${nIni ? ` · <span class="has-ini-text">${uiIcon('gear', 11)} ${nIni} settings</span>` : ''}</div>
-        <div class="mod-card-sum">${esc(m.sum || '')}</div>
-        <div class="mod-card-actions">
-          <a class="btn small" href="${esc(cfUrl)}" target="_blank" rel="noopener" title="View on CurseForge">${uiIcon('external', 13)}</a>
-        </div>
-      </div>`;
-    const actions = card.querySelector('.mod-card-actions');
-    const bAdd = document.createElement('button');
-    const selected = isModSelected(m.id);
-    bAdd.className = 'btn small' + (selected ? '' : ' primary');
-    bAdd.innerHTML = selected ? uiIcon('check', 14) + ' Added' : uiIcon('plus', 14) + ' Add';
-    bAdd.disabled = selected;
-    bAdd.addEventListener('click', () => {
+  for (const m of list) wrap.appendChild(makeModBrowserCard(m));
+}
+
+/* One catalog entry in the Mod Browser grid. */
+function makeModBrowserCard(m) {
+  const nIni = iniCount(m);
+  const catInfo = modCatInfo(m.cat);
+  const card = document.createElement('div');
+  card.className = 'mod-card';
+  card.innerHTML = `
+    ${modThumbMarkup(m)}
+    <div class="mod-card-body">
+      <div class="mod-card-title">${esc(m.name)}</div>
+      <div class="mod-card-meta">${uiIcon(catInfo.iconName, 12)} ${esc(catInfo.name)}${m.dl ? ` · ${uiIcon('download', 11)} ${fmtDl(m.dl)}` : ''}${nIni ? ` · <span class="has-ini-text">${uiIcon('gear', 11)} ${nIni} settings</span>` : ''}</div>
+      <div class="mod-card-sum">${esc(m.sum || '')}</div>
+      <div class="mod-card-actions">
+        <a class="btn small" href="${esc(modCurseforgeUrl(m))}" target="_blank" rel="noopener" title="View on CurseForge">${uiIcon('external', 13)}</a>
+      </div>
+    </div>`;
+  const actions = card.querySelector('.mod-card-actions');
+  const selected = isModSelected(m.id);
+  const bAdd = uiButton(null, {
+    small: true,
+    variant: selected ? '' : 'primary',
+    html: selected ? uiIcon('check', 14) + ' Added' : uiIcon('plus', 14) + ' Add',
+    disabled: selected,
+    onClick: () => {
       addMod({ id: m.id });
       bAdd.innerHTML = uiIcon('check', 14) + ' Added';
       bAdd.disabled = true;
       bAdd.classList.remove('primary');
       if (currentCat === 'mods') render();
-    });
-    actions.insertBefore(bAdd, actions.firstChild);
-    wrap.appendChild(card);
-  }
+    },
+  });
+  actions.insertBefore(bAdd, actions.firstChild);
+  return card;
 }
 
-/* ---------------- add by ID / URL (live CurseForge lookup) ---------------- */
-async function addModByIdOrUrl(input) {
-  let lookup = null;
-  const urlMatch = input.match(/curseforge\.com\/ark-survival-ascended\/mods\/([a-z0-9-]+)/i);
-  const idMatch = input.match(/\b(\d{4,8})\b/);
-  if (urlMatch) lookup = 'ark-survival-ascended/mods/' + urlMatch[1];
-  else if (idMatch) lookup = idMatch[1];
-  else { toast('Type a CurseForge project ID (a number) or paste the mod page URL.'); return; }
+/* ---------------- add by ID / URL (live CurseForge lookup) ----------------
+   Five things can go wrong here (unparseable input, CurseForge still
+   preparing the project, CurseForge unreachable, a project for another game,
+   a project we cannot identify), so the flow is split: one function decides
+   *what* the user typed, one adds it, and one explains each failure. */
 
-  if (idMatch && modById.has(parseInt(idMatch[1], 10))) {
-    if (addMod({ id: parseInt(idMatch[1], 10) }) && currentCat === 'mods') render();
-    return;
-  }
+/** Adds a mod, re-rendering the mods page when it is the one on screen. */
+function addModAndRefresh(entry) {
+  const added = addMod(entry);
+  if (added && (currentCat === 'mods' || currentCat === 'mod:' + entry.id)) render();
+  return added;
+}
 
-  toast('Looking up the mod on CurseForge…');
-  let j = null;
-  let failReason = '';
-  try { j = await fetchCfwidget(lookup); } catch (e) { failReason = String(e.message); }
-  if (j) j.id = parseInt(j.id, 10);
-  if ((!j || !Number.isFinite(j.id)) && failReason === 'queued') {
-    toast('CurseForge is still preparing this mod’s info — try again in a minute.');
-    return;
-  }
-  if (!j || !Number.isFinite(j.id) || j.id <= 0) {
-    if (idMatch) {
-      const id = parseInt(idMatch[1], 10);
-      const name = prompt('Could not reach CurseForge (offline or mod not found).\nAdd mod ' + id + ' anyway? Type a name for it:', 'Mod ' + id);
-      if (name && addMod({ id, name }) && currentCat === 'mods') render();
-    } else {
-      toast('Could not look up that mod. Check the URL, or use its numeric project ID.');
-    }
-    return;
-  }
-  if (j.game && j.game !== 'ark-survival-ascended') {
-    toast(`That project is for "${j.game}", not ARK: Survival Ascended.`);
-    return;
-  }
-  if (modById.has(j.id)) {
-    if (addMod({ id: j.id }) && currentCat === 'mods') render();
-    return;
-  }
+/**
+ * Works out what the user pasted.
+ * @returns {{ lookup: string, id: number|null }|null} null when it is neither
+ *   a CurseForge mod URL nor a project id.
+ */
+function parseModLookup(input) {
+  const text = String(input || '');
+  const urlMatch = text.match(/curseforge\.com\/ark-survival-ascended\/mods\/([a-z0-9-]+)/i);
+  const idMatch = text.match(/\b(\d{4,8})\b/);
+  const id = idMatch ? parseInt(idMatch[1], 10) : null;
+  if (urlMatch) return { lookup: 'ark-survival-ascended/mods/' + urlMatch[1], id };
+  if (idMatch) return { lookup: idMatch[1], id };
+  return null;
+}
 
-  const entry = {
-    id: j.id,
-    name: j.title || ('Mod ' + j.id),
-    sum: (j.summary || '').slice(0, 140),
-    thumb: j.thumbnail || '',
-    slug: (j.urls && j.urls.curseforge || '').split('/').pop() || '',
-    author: (j.members && j.members[0] && j.members[0].username) || '',
-    dl: j.downloads && j.downloads.total || 0,
+/* Offline/not-found fallback for a numeric id: the mod still loads on the
+   server by id alone, so let the user add it by hand rather than lose the
+   whole action. */
+function addUnknownModByPrompt(id, reason) {
+  const name = prompt(reason + '\nAdd mod ' + id + ' anyway? Type a name for it:', 'Mod ' + id);
+  if (name) addModAndRefresh({ id, name });
+}
+
+/** Turns a cfwidget project into the entry we store in state.mods. */
+function modEntryFromProject(project) {
+  return {
+    id: project.id,
+    name: project.title || ('Mod ' + project.id),
+    sum: (project.summary || '').slice(0, 140),
+    thumb: project.thumbnail || '',
+    slug: (project.urls && project.urls.curseforge || '').split('/').pop() || '',
+    author: (project.members && project.members[0] && project.members[0].username) || '',
+    dl: project.downloads && project.downloads.total || 0,
     cat: 'other',
   };
-  const alreadySelected = isModSelected(entry.id);
-  addMod(entry);
+}
 
-  // run the full discovery pipeline on the data we already fetched (new adds
-  // only — never clobber settings/extra lines the user already has)
-  if (!alreadySelected) {
-    discoverModSettings(entry.id, { data: j, silent: true }).then((n) => {
-      if (n > 0) toast(`Found ${n} setting${n === 1 ? '' : 's'} on the mod page — its settings page is ready!`);
-      else if (((state.modDocs || {})[entry.id] || []).length) toast(`${entry.name} documents its settings in a linked doc — see its page in the sidebar.`);
-    });
+async function addModByIdOrUrl(input) {
+  const parsed = parseModLookup(input);
+  if (!parsed) { toast('Type a CurseForge project ID (a number) or paste the mod page URL.'); return; }
+
+  // already in the bundled catalog: no network needed at all
+  if (parsed.id !== null && modById.has(parsed.id)) { addModAndRefresh({ id: parsed.id }); return; }
+
+  toast('Looking up the mod on CurseForge…');
+  let project = null;
+  let failure = null;
+  try { project = await fetchCfwidget(parsed.lookup); } catch (e) { failure = e; }
+  if (project) project.id = parseInt(project.id, 10);
+
+  if (!project || !Number.isFinite(project.id) || project.id <= 0) {
+    addModLookupFailed(parsed, failure);
+    return;
   }
-  if (currentCat === 'mods' || currentCat === 'mod:' + entry.id) render();
+  if (project.game && project.game !== 'ark-survival-ascended') {
+    toast(`That project is for "${project.game}", not ARK: Survival Ascended.`);
+    return;
+  }
+  if (modById.has(project.id)) { addModAndRefresh({ id: project.id }); return; }
+
+  const entry = modEntryFromProject(project);
+  const alreadySelected = isModSelected(entry.id);
+  addModAndRefresh(entry);
+  if (!alreadySelected) discoverSettingsForNewMod(entry, project);
+}
+
+/* The lookup produced nothing usable — say which of the possible reasons it
+   was, and offer the manual fallback when we have a numeric id to fall back to. */
+function addModLookupFailed(parsed, failure) {
+  if (isCfError(failure, CF_ERROR.QUEUED)) { toast(cfErrorMessage(failure)); return; }
+  if (parsed.id !== null) {
+    addUnknownModByPrompt(parsed.id, failure ? cfErrorMessage(failure) : 'CurseForge did not recognise that mod.');
+    return;
+  }
+  toast('Could not look up that mod. Check the URL, or use its numeric project ID.');
+}
+
+/* Run the full discovery pipeline on the data we already fetched (new adds
+   only — never clobber settings/extra lines the user already has). */
+function discoverSettingsForNewMod(entry, project) {
+  discoverModSettings(entry.id, { data: project, silent: true }).then((n) => {
+    if (n > 0) toast(`Found ${n} setting${n === 1 ? '' : 's'} on the mod page — its settings page is ready!`);
+    else if (((state.modDocs || {})[entry.id] || []).length) toast(`${entry.name} documents its settings in a linked doc — see its page in the sidebar.`);
+  });
 }
 
 /* Scan a CurseForge description (HTML) for INI-style config blocks. */
@@ -1194,4 +1429,22 @@ function initModsUI() {
     op.textContent = MOD_CATS[c].name;
     sel.appendChild(op);
   }
+}
+
+/**
+ * Drops every module-level cache this file keeps, so a different account never
+ * inherits the previous one's browser filter or half-finished import.
+ * Called by auth.js when the signed-in user changes; nothing here calls it.
+ */
+function resetModsUiState() {
+  browserFilter = { ...DEFAULT_BROWSER_FILTER };
+  importTouchedMods.clear();
+  // the dialog's own controls are rebuilt from browserFilter on open, but the
+  // inputs live in static markup and would otherwise keep the old text
+  const search = document.getElementById('modSearch');
+  if (search) search.value = '';
+  const catFilter = document.getElementById('modCatFilter');
+  if (catFilter) catFilter.value = DEFAULT_BROWSER_FILTER.cat;
+  const sort = document.getElementById('modSort');
+  if (sort) sort.value = DEFAULT_BROWSER_FILTER.sort;
 }

@@ -10,8 +10,25 @@ permissions:
   contents: read
 
 jobs:
+  static:
+    name: Lint and static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      # The renderer has no bundler: every <script> shares one global scope, so
+      # a duplicate top-level name is a SyntaxError that stops the app booting.
+      # ESLint cannot see across files; this check can.
+      - run: npm run check:globals
+
   test:
     name: Smoke test
+    needs: static
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

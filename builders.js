@@ -100,8 +100,11 @@ const BUILDERS = {
       const cls = (line.match(/ItemClassString\s*=\s*"([^"]*)"/) || [])[1];
       const qty = (line.match(/MaxItemQuantity\s*=\s*([\d.]+)/) || [])[1];
       const ign = (line.match(/bIgnoreMultiplier\s*=\s*(\w+)/) || [])[1];
-      if (!cls || !qty) return null;
-      return { ItemClassString: cls, __maxQty: parseInt(qty, 10), __ignoreMult: /^true$/i.test(ign || 'true') };
+      /* An unreadable quantity leaves the line unparsed, so it is preserved
+         verbatim instead of being rewritten as `MaxItemQuantity=NaN`. */
+      const max = builderInteger(qty, null);
+      if (!cls || max === null) return null;
+      return { ItemClassString: cls, __maxQty: max, __ignoreMult: /^true$/i.test(ign || 'true') };
     },
   },
   ConfigOverrideItemCraftingCosts: {
@@ -119,7 +122,8 @@ const BUILDERS = {
       if (!cls) return null;
       const res = [];
       for (const m of line.matchAll(/ResourceItemTypeString\s*=\s*"([^"]*)"[^)]*?BaseResourceRequirement\s*=\s*([\d.]+)/g)) {
-        res.push({ c: m[1], amt: parseFloat(m[2]) });
+        const amt = builderNumber(m[2], null);   // `.` matches [\d.]+ but is not a number
+        if (amt !== null) res.push({ c: m[1], amt });
       }
       if (!res.length) return null;
       return { ItemClassString: cls, __res: res };
@@ -136,11 +140,14 @@ function spawnEntryName(cls) {
 }
 function serializeSpawnRows(v, withWeights) {
   const rows = v.rows || [];
+  /* Weights and caps are normalised here so a blank or unreadable box can
+     never reach the config as `EntryWeight=NaN`. */
   const entries = withWeights
-    ? rows.map((r) => `(AnEntryName="${spawnEntryName(r.c)}",EntryWeight=${r.w ?? 1},NPCsToSpawnStrings=("${r.c}"))`)
+    ? rows.map((r) => `(AnEntryName="${spawnEntryName(r.c)}",EntryWeight=${builderNumber(r.w, 1)},NPCsToSpawnStrings=("${r.c}"))`)
     : rows.map((r) => `(NPCsToSpawnStrings=("${r.c}"))`);
   const limits = withWeights
-    ? rows.filter((r) => r.pct > 0).map((r) => `(NPCClassString="${r.c}",MaxPercentageOfDesiredNumToAllow=${r.pct})`)
+    ? rows.filter((r) => builderNumber(r.pct, 0) > 0)
+      .map((r) => `(NPCClassString="${r.c}",MaxPercentageOfDesiredNumToAllow=${builderNumber(r.pct, 0)})`)
     : [];
   let out = `(NPCSpawnEntriesContainerClassString="${v.container}",NPCSpawnEntries=(${entries.join(',')})`;
   if (limits.length) out += `,NPCSpawnLimits=(${limits.join(',')})`;
@@ -152,7 +159,7 @@ function parseSpawnRows(line, withWeights) {
   const rows = [];
   if (withWeights) {
     for (const m of line.matchAll(/EntryWeight\s*=\s*([\d.]+)\s*,\s*NPCsToSpawnStrings\s*=\s*\(\s*"([^"]+)"/g)) {
-      rows.push({ c: m[2], w: parseFloat(m[1]), pct: 0 });
+      rows.push({ c: m[2], w: builderNumber(m[1], 1), pct: 0 });
     }
   }
   for (const m of line.matchAll(/NPCsToSpawnStrings\s*=\s*\(\s*"([^"]+)"/g)) {
@@ -160,7 +167,7 @@ function parseSpawnRows(line, withWeights) {
   }
   for (const m of line.matchAll(/NPCClassString\s*=\s*"([^"]+)"[^)]*MaxPercentageOfDesiredNumToAllow\s*=\s*([\d.]+)/g)) {
     const row = rows.find((r) => r.c === m[1]);
-    if (row) row.pct = parseFloat(m[2]);
+    if (row) row.pct = builderNumber(m[2], 0);
   }
   return rows.length ? { container, rows } : null;
 }
@@ -225,16 +232,57 @@ function builderDb(t) {
   return modded.length ? base.concat(modded) : base;
 }
 
-/* ---------------- generic serialize / parse ---------------- */
+/* ---------------- generic serialize / parse ----------------
+   Everything below eventually round-trips through the user's *real* server
+   config, so two rules hold throughout: a failed parse falls back to the
+   field's default (never NaN), and a value that is not writable is omitted
+   rather than written out as `NaN` / `undefined`. */
+
+/** Escapes a string so it can be embedded literally in a RegExp. */
+function builderRegExpEscape(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/* THE TRAP — do not remove the anchor or the escaping.
+   Builder field keys overlap: DinoSpawnWeightMultipliers declares BOTH
+   `OverrideSpawnLimitPercentage` and `SpawnLimitPercentage`. An unanchored
+   pattern for the shorter key matches *inside* the longer one, so parsing
+   `(...,OverrideSpawnLimitPercentage=True,SpawnLimitPercentage=0.25)` used to
+   capture "True" for SpawnLimitPercentage, and parseFloat('True') = NaN was
+   then written straight back into the user's config. A key must therefore be
+   preceded by start-of-string, `(` or `,` (plus optional whitespace), and be
+   regex-escaped in case a key ever contains a metacharacter. */
+function builderKeyPattern(key) {
+  return new RegExp('(?:^|[(,])\\s*' + builderRegExpEscape(key) + '\\s*=\\s*"?([^,()"]*)"?', 'i');
+}
+
+/** parseFloat that yields `fallback` instead of NaN/Infinity. */
+function builderNumber(value, fallback) {
+  const n = typeof value === 'number' ? value : parseFloat(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** parseInt that yields `fallback` instead of NaN. */
+function builderInteger(value, fallback) {
+  const n = typeof value === 'number' ? Math.trunc(value) : parseInt(value, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function serializeEntry(spec, v) {
   if (spec.serialize) return spec.serialize(v);
   if (spec.bare) return String(v[''] || '').trim();
   const parts = [];
   for (const f of spec.fields) {
     let val = v[f.k];
-    if (val === undefined || val === null || val === '') {
+    const missing = val === undefined || val === null || val === '';
+    const broken = typeof val === 'number' && !Number.isFinite(val);   // NaN / ±Infinity
+    if (missing) {
       if (f.allowEmpty && f.quote) { parts.push(`${f.k}=""`); continue; }
       if (f.t === 'bool' && f.d !== undefined) val = f.d;
+      else continue;
+    } else if (broken) {
+      // A broken number is rescued by the field default, or dropped entirely.
+      if (f.d !== undefined) val = f.d;
       else continue;
     }
     if (f.t === 'bool') parts.push(`${f.k}=${val ? 'True' : 'False'}`);
@@ -243,6 +291,7 @@ function serializeEntry(spec, v) {
   }
   return '(' + parts.join(',') + ')';
 }
+
 function parseEntryLine(spec, line) {
   line = line.trim();
   if (!line) return null;
@@ -255,13 +304,16 @@ function parseEntryLine(spec, line) {
   const v = {};
   let any = false;
   for (const f of spec.fields) {
-    const m = line.match(new RegExp(f.k + '\\s*=\\s*"?([^,()"]*)"?', 'i'));
+    const m = line.match(builderKeyPattern(f.k));
     if (!m) continue;
     any = true;
-    let val = m[1].trim();
+    const val = m[1].trim();
+    /* An unreadable number becomes the field default when it has one, and an
+       empty (i.e. "leave unchanged") value otherwise — never NaN. */
+    const fallback = f.d !== undefined ? f.d : '';
     if (f.t === 'bool') v[f.k] = /^true$/i.test(val);
-    else if (f.t === 'int') v[f.k] = val === '' ? '' : parseInt(val, 10);
-    else if (f.t === 'float') v[f.k] = val === '' ? '' : parseFloat(val);
+    else if (f.t === 'int') v[f.k] = val === '' ? '' : builderInteger(val, fallback);
+    else if (f.t === 'float') v[f.k] = val === '' ? '' : builderNumber(val, fallback);
     else v[f.k] = val;
   }
   return any ? v : null;
@@ -296,22 +348,99 @@ function comboGroupOf(t, e) {
   return e.g || 'Other';
 }
 
-function makeCombo(t, placeholder) {
-  const wrap = document.createElement('div');
-  wrap.className = 'combo';
+/** The human label of a database entry (spawn areas carry their map name). */
+function comboLabelOf(t, e) {
+  return t === 'spawnarea' && e.m ? `${e.n} (${e.m})` : e.n;
+}
+
+/** The class name (or dino tag) a database entry commits as its value. */
+function comboValueOf(t, e) {
+  if (t === 'dinotag') return e.t || e.n;
+  return e.c;
+}
+
+/**
+ * The visible slice of the database for a search term: an empty term browses
+ * the head of the full list, a term narrows it. Pure — no DOM.
+ *
+ * @returns {{ db: Array, hits: Array }} `db` is the full list, for the "N more" hint.
+ */
+function comboMatches(t, term) {
+  const db = builderDb(t);
+  const hits = term
+    ? db.filter((e) => e.n.toLowerCase().includes(term) || e.c.toLowerCase().includes(term)).slice(0, COMBO_SEARCH_LIMIT)
+    : db.slice(0, COMBO_BROWSE_LIMIT);
+  return { db, hits };
+}
+
+/** One clickable dropdown row. `onPick(value, label)` commits the choice. */
+function comboEntryRow(t, e, onPick) {
+  const cls = t === 'dinotag' ? (e.t || '') : e.c;
+  const label = comboLabelOf(t, e);
+  const row = uiElement('div', {
+    className: 'combo-row',
+    html: `<b>${esc(label)}</b>${e.mod ? ` <span class="mod-badge">${esc(e.mod)}</span>` : ''}<code>${esc(cls)}</code>`,
+  });
+  // mousedown (not click) so the pick lands before the input's blur handler.
+  row.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+    onPick(comboValueOf(t, e), label);
+  });
+  return row;
+}
+
+/**
+ * Render-only: rebuilds `drop` for the current term and returns whether
+ * anything matched. Never touches the committed value.
+ */
+function comboRenderDrop(t, drop, term, onPick) {
+  const { db, hits } = comboMatches(t, term);
+  drop.innerHTML = '';
+  let lastGroup = null;
+  for (const e of hits) {
+    if (!term) {
+      const group = comboGroupOf(t, e);
+      if (group !== lastGroup) {
+        lastGroup = group;
+        uiElement('div', { className: 'combo-group', text: group, parent: drop });
+      }
+    }
+    drop.appendChild(comboEntryRow(t, e, onPick));
+  }
+  if (!term && db.length > hits.length) {
+    uiElement('div', { className: 'combo-group', text: `…${db.length - hits.length} more — type to narrow the list`, parent: drop });
+  }
+  return hits.length > 0;
+}
+
+/** The inert DOM skeleton of a combo: wrapper, input, chevron and dropdown. */
+function comboSkeleton(placeholder) {
+  const wrap = uiElement('div', { className: 'combo' });
   const inp = document.createElement('input');
   inp.type = 'text';
   inp.placeholder = placeholder || 'Search or browse…';
   inp.autocomplete = 'off';
-  const chevron = document.createElement('button');
-  chevron.type = 'button';
-  chevron.className = 'combo-chevron';
-  chevron.tabIndex = -1;
-  chevron.innerHTML = uiIcon('chevdown', 15);
-  const drop = document.createElement('div');
-  drop.className = 'combo-drop';
+  // Not a uiButton: the chevron is styled by `.combo-chevron` alone, not `.btn`.
+  const chevron = uiElement('button', {
+    className: 'combo-chevron',
+    html: uiIcon('chevdown', 15),
+    attrs: { type: 'button', tabindex: '-1' },
+  });
+  const drop = uiElement('div', { className: 'combo-drop' });
   drop.style.display = 'none';
   wrap.append(inp, chevron, drop);
+  return { wrap, inp, chevron, drop };
+}
+
+/**
+ * A searchable dropdown bound to one picker database.
+ *
+ * @param {string} t            field type: dino | dinotag | engram | item | spawnarea
+ * @param {string} [placeholder]
+ * @returns {{ el: HTMLElement, get: () => string, set: (v: string) => void, isPicked: () => boolean }}
+ */
+function makeCombo(t, placeholder) {
+  const { wrap, inp, chevron, drop } = comboSkeleton(placeholder);
 
   let value = '';
   const commit = (val, label) => {
@@ -320,57 +449,22 @@ function makeCombo(t, placeholder) {
     drop.style.display = 'none';
     inp.classList.add('combo-ok');
   };
-  const entryRow = (e) => {
-    const row = document.createElement('div');
-    row.className = 'combo-row';
-    const cls = t === 'dinotag' ? (e.t || '') : e.c;
-    const label = t === 'spawnarea' && e.m ? `${e.n} (${e.m})` : e.n;
-    row.innerHTML = `<b>${esc(label)}</b>${e.mod ? ` <span class="mod-badge">${esc(e.mod)}</span>` : ''}<code>${esc(cls)}</code>`;
-    row.addEventListener('mousedown', (ev) => {
-      ev.preventDefault();
-      commit(t === 'dinotag' ? (e.t || e.n) : e.c, label);
-    });
-    return row;
-  };
-  /* render-only: rebuilds the dropdown list. The committed value is cleared
-     ONLY when the user actually types (see the input handler) — merely
-     focusing/browsing a filled combo must never discard a committed pick. */
+  /* The committed value is cleared ONLY when the user actually types (see the
+     input handler) — merely focusing/browsing a filled combo must never
+     discard a committed pick. */
   const refresh = () => {
-    const term = inp.value.trim().toLowerCase();
-    const db = builderDb(t);
-    const hits = term
-      ? db.filter((e) => e.n.toLowerCase().includes(term) || e.c.toLowerCase().includes(term)).slice(0, COMBO_SEARCH_LIMIT)
-      : db.slice(0, COMBO_BROWSE_LIMIT);
-    drop.innerHTML = '';
-    let lastGroup = null;
-    for (const e of hits) {
-      if (!term) {
-        const group = comboGroupOf(t, e);
-        if (group !== lastGroup) {
-          lastGroup = group;
-          const g = document.createElement('div');
-          g.className = 'combo-group';
-          g.textContent = group;
-          drop.appendChild(g);
-        }
-      }
-      drop.appendChild(entryRow(e));
-    }
-    if (!term && db.length > hits.length) {
-      const more = document.createElement('div');
-      more.className = 'combo-group';
-      more.textContent = `…${db.length - hits.length} more — type to narrow the list`;
-      drop.appendChild(more);
-    }
-    drop.style.display = hits.length ? '' : 'none';
+    const matched = comboRenderDrop(t, drop, inp.value.trim().toLowerCase(), commit);
+    drop.style.display = matched ? '' : 'none';
   };
+
   inp.addEventListener('input', () => {
     value = '';
     inp.classList.remove('combo-ok');
     refresh();
   });
   inp.addEventListener('focus', refresh);
-  inp.addEventListener('blur', () => setTimeout(() => { drop.style.display = 'none'; }, 150));
+  // Delayed so a mousedown on a row is processed before the list disappears.
+  inp.addEventListener('blur', () => setTimeout(() => { drop.style.display = 'none'; }, APP_TIMEOUTS.COMBO_BLUR_MS));
   chevron.addEventListener('mousedown', (ev) => {
     ev.preventDefault();
     if (drop.style.display === 'none') { inp.focus(); } else { drop.style.display = 'none'; }
@@ -420,204 +514,370 @@ function saveEntries() {
   textarea.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-function renderEntriesBuilder() {
-  const { spec, entries } = builderCtx;
-  const body = $('builderBody');
-  body.innerHTML = '';
+/* ---------------- entry field editors ----------------
+   One factory per field type. Each builds its own DOM into `fieldWrap` and
+   returns a control adapter: `get()` yields the value to store in the entry
+   object, in exactly the shape serializeEntry() expects. */
 
-  // current entries
-  const list = document.createElement('div');
-  list.className = 'builder-list';
+const BUILDER_COMBO_TYPES = new Set(['engram', 'dino', 'item', 'dinotag', 'spawnarea']);
+const BUILDER_COMBO_NOUNS = { engram: 'engrams', item: 'items', spawnarea: 'spawn areas' };
+
+/** Searchable dropdown for a class name / dino tag. */
+function builderComboField(f, fieldWrap, editing) {
+  const combo = makeCombo(f.t, 'Search or browse ' + (BUILDER_COMBO_NOUNS[f.t] || 'creatures') + '…');
+  if (editing && editing[f.k]) combo.set(editing[f.k]);
+  fieldWrap.appendChild(combo.el);
+  return combo;
+}
+
+/** Checkbox, rendered inside the field's own label so the text is clickable. */
+function builderBoolField(f, label, editing) {
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = editing ? Boolean(editing[f.k]) : Boolean(f.d);
+  label.prepend(cb);
+  label.style.cursor = 'pointer';
+  return { get: () => cb.checked };
+}
+
+/** Rows of creature + (when `f.cols`) spawn weight and max-share columns. */
+function builderDinoListField(f, fieldWrap, editing) {
+  const listWrap = uiElement('div', { className: 'reslist', parent: fieldWrap });
+  const rows = [];
+
+  const addRow = (preset) => {
+    const rr = uiElement('div', { className: 'reslist-row' });
+    const combo = makeCombo('dino', 'Creature…');
+    if (preset && preset.c) combo.set(preset.c);
+    rr.appendChild(combo.el);
+    let wInp = null;
+    let pctInp = null;
+    if (f.cols) {
+      wInp = document.createElement('input');
+      wInp.type = 'number';
+      wInp.step = '0.1';
+      wInp.min = 0;
+      wInp.value = preset && preset.w !== undefined ? preset.w : 1;
+      wInp.title = 'Spawn weight — higher = more common';
+      pctInp = document.createElement('input');
+      pctInp.type = 'number';
+      pctInp.step = '0.05';
+      pctInp.min = 0;
+      pctInp.max = 1;
+      pctInp.value = preset && preset.pct ? preset.pct : '';
+      pctInp.placeholder = 'max %';
+      pctInp.title = 'Optional cap: max share of this area (0.25 = 25%)';
+      const wLab = uiElement('label', { text: 'weight' });
+      wLab.style.fontSize = '.78rem';
+      rr.append(wLab, wInp, pctInp);
+    }
+    const entry = { combo, wInp, pctInp, rr };
+    uiButton(rr, {
+      small: true,
+      html: uiIcon('x', 13),
+      title: 'Remove',
+      onClick: () => { rr.remove(); rows.splice(rows.indexOf(entry), 1); },
+    });
+    rows.push(entry);
+    listWrap.insertBefore(rr, addBtn);
+  };
+
+  const addBtn = uiButton(listWrap, {
+    small: true,
+    html: uiIcon('plus', 13) + ' Add creature',
+    onClick: () => addRow(),
+  });
+
+  if (editing && Array.isArray(editing[f.k]) && editing[f.k].length) editing[f.k].forEach(addRow);
+  else addRow();
+
+  return {
+    /* Blank or unreadable boxes fall back to a usable weight / no cap so the
+       serializer never sees NaN. */
+    get: () => rows
+      .map((r) => ({
+        c: r.combo.get(),
+        w: r.wInp ? builderNumber(r.wInp.value, 1) : undefined,
+        pct: r.pctInp ? builderNumber(r.pctInp.value, 0) : undefined,
+      }))
+      .filter((r) => r.c),
+  };
+}
+
+/** Rows of resource + amount, for crafting-cost overrides. */
+function builderResListField(f, fieldWrap, editing) {
+  const resWrap = uiElement('div', { className: 'reslist', parent: fieldWrap });
+  const rows = [];
+
+  const addRow = (c, amt) => {
+    const rr = uiElement('div', { className: 'reslist-row' });
+    const combo = makeCombo('item', 'Resource…');
+    if (c) combo.set(c);
+    const num = document.createElement('input');
+    num.type = 'number';
+    num.value = amt || 10;
+    num.min = 0;
+    num.title = 'Amount needed';
+    const entry = { combo, num };
+    rr.appendChild(combo.el);
+    rr.appendChild(num);
+    uiButton(rr, {
+      small: true,
+      html: uiIcon('x', 13),
+      title: 'Remove',
+      onClick: () => { rr.remove(); rows.splice(rows.indexOf(entry), 1); },
+    });
+    rows.push(entry);
+    resWrap.insertBefore(rr, addBtn);
+  };
+
+  const addBtn = uiButton(resWrap, {
+    small: true,
+    html: uiIcon('plus', 13) + ' Add resource',
+    onClick: () => addRow(),
+  });
+
+  if (editing && Array.isArray(editing[f.k])) for (const r of editing[f.k]) addRow(r.c, r.amt);
+  else addRow();
+
+  return { get: () => rows.map((r) => ({ c: r.combo.get(), amt: builderNumber(r.num.value, 0) })).filter((r) => r.c) };
+}
+
+/** Plain number box for `int` / `float` fields. */
+function builderNumberField(f, fieldWrap, editing) {
+  const num = document.createElement('input');
+  num.type = 'number';
+  if (f.t === 'float') num.step = '0.1';
+  if (f.ph) num.placeholder = f.ph;
+  if (editing && editing[f.k] !== undefined && editing[f.k] !== '') num.value = editing[f.k];
+  else if (!editing && f.d !== undefined) num.value = f.d;
+  fieldWrap.appendChild(num);
+  return {
+    /* Empty stays empty (= "leave this setting alone"); anything unreadable
+       becomes the field default rather than NaN. */
+    get: () => {
+      if (String(num.value).trim() === '') return '';
+      const fallback = f.d !== undefined ? f.d : '';
+      return f.t === 'int' ? builderInteger(num.value, fallback) : builderNumber(num.value, fallback);
+    },
+  };
+}
+
+/** Free-text box — the fallback for any field type without a richer editor. */
+function builderTextField(f, fieldWrap, editing) {
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.autocomplete = 'off';
+  if (f.ph) inp.placeholder = f.ph;
+  if (editing && editing[f.k] !== undefined) inp.value = editing[f.k];
+  else if (!editing && f.d !== undefined) inp.value = f.d;
+  fieldWrap.appendChild(inp);
+  return { get: () => inp.value.trim() };
+}
+
+/**
+ * Builds the editor for one field of an entry spec.
+ *
+ * @param {object} f          field descriptor from BUILDERS[*].fields
+ * @param {HTMLElement} fieldWrap  the `.builder-field` wrapper to fill
+ * @param {HTMLElement} label      the wrapper's <label> (bool fields nest into it)
+ * @param {object|null} editing    the entry being edited, or null when adding
+ * @returns {{ get: () => unknown }}
+ */
+function builderFieldControl(f, fieldWrap, label, editing) {
+  if (BUILDER_COMBO_TYPES.has(f.t)) return builderComboField(f, fieldWrap, editing);
+  if (f.t === 'dinolist') return builderDinoListField(f, fieldWrap, editing);
+  if (f.t === 'bool') return builderBoolField(f, label, editing);
+  if (f.t === 'reslist') return builderResListField(f, fieldWrap, editing);
+  if (f.t === 'int' || f.t === 'float') return builderNumberField(f, fieldWrap, editing);
+  return builderTextField(f, fieldWrap, editing);
+}
+
+/* ---------------- entries builder ---------------- */
+
+/** The list of entries already present, with per-row edit / remove actions. */
+function renderExistingEntries(spec, entries) {
+  const list = uiElement('div', { className: 'builder-list' });
   if (!entries.length && !builderCtx.rawLines.length) {
     list.innerHTML = `<div class="empty-msg" style="padding:14px 0">Nothing here yet — add your first ${esc(spec.entryName)} below.</div>`;
   }
   entries.forEach((v, i) => {
-    const row = document.createElement('div');
-    row.className = 'picker-row';
-    row.innerHTML = `<div class="picker-row-main">${entrySummary(spec, v)}<br><code>${esc(serializeEntry(spec, v)).slice(0, 120)}</code></div>`;
-    const btns = document.createElement('div');
-    btns.className = 'picker-row-btns';
-    const bEdit = document.createElement('button');
-    bEdit.className = 'btn small';
-    bEdit.innerHTML = uiIcon('pencil', 14);
-    bEdit.title = 'Edit';
-    bEdit.addEventListener('click', () => { builderCtx.editIndex = i; renderEntriesBuilder(); });
-    const bDel = document.createElement('button');
-    bDel.className = 'btn small';
-    bDel.innerHTML = uiIcon('x', 14);
-    bDel.title = 'Remove';
-    bDel.addEventListener('click', () => { entries.splice(i, 1); saveEntries(); builderCtx.editIndex = -1; renderEntriesBuilder(); });
-    btns.appendChild(bEdit); btns.appendChild(bDel);
-    row.appendChild(btns);
-    list.appendChild(row);
+    const row = uiElement('div', {
+      className: 'picker-row',
+      html: `<div class="picker-row-main">${entrySummary(spec, v)}<br><code>${esc(serializeEntry(spec, v)).slice(0, 120)}</code></div>`,
+      parent: list,
+    });
+    const btns = uiElement('div', { className: 'picker-row-btns', parent: row });
+    uiButton(btns, {
+      small: true, html: uiIcon('pencil', 14), title: 'Edit',
+      onClick: () => { builderCtx.editIndex = i; renderEntriesBuilder(); },
+    });
+    uiButton(btns, {
+      small: true, html: uiIcon('x', 14), title: 'Remove',
+      onClick: () => { entries.splice(i, 1); saveEntries(); builderCtx.editIndex = -1; renderEntriesBuilder(); },
+    });
   });
-  if (builderCtx.rawLines.length) {
-    const note = document.createElement('p');
-    note.className = 'opt-help';
-    note.textContent = `(${builderCtx.rawLines.length} line${builderCtx.rawLines.length === 1 ? '' : 's'} in a custom format ${'are'} kept unchanged.)`;
-    list.appendChild(note);
+  const raw = builderCtx.rawLines.length;
+  if (raw) {
+    uiElement('p', {
+      className: 'opt-help',
+      text: `(${raw} line${raw === 1 ? '' : 's'} in a custom format ${raw === 1 ? 'is' : 'are'} kept unchanged.)`,
+      parent: list,
+    });
   }
-  body.appendChild(list);
+  return list;
+}
 
-  // add / edit form
-  const editing = builderCtx.editIndex >= 0 ? entries[builderCtx.editIndex] : null;
-  const form = document.createElement('div');
-  form.className = 'builder-form';
-  form.innerHTML = `<div class="opt-name" style="margin-bottom:8px">${editing ? 'Edit' : 'Add a'} ${esc(spec.entryName)}</div>`;
+/** The add/edit form for one entry. Returns the form plus its control map. */
+function renderEntryForm(spec, editing) {
+  const form = uiElement('div', {
+    className: 'builder-form',
+    html: `<div class="opt-name" style="margin-bottom:8px">${editing ? 'Edit' : 'Add a'} ${esc(spec.entryName)}</div>`,
+  });
   const controls = {};
   for (const f of spec.fields) {
-    const fw = document.createElement('div');
-    fw.className = 'builder-field';
-    const lab = document.createElement('label');
-    lab.textContent = f.n + (f.req ? ' *' : '');
-    fw.appendChild(lab);
-    if (f.t === 'engram' || f.t === 'dino' || f.t === 'item' || f.t === 'dinotag' || f.t === 'spawnarea') {
-      const what = { engram: 'engrams', item: 'items', spawnarea: 'spawn areas' }[f.t] || 'creatures';
-      const combo = makeCombo(f.t, 'Search or browse ' + what + '…');
-      if (editing && editing[f.k]) combo.set(editing[f.k]);
-      controls[f.k] = combo;
-      fw.appendChild(combo.el);
-    } else if (f.t === 'dinolist') {
-      // rows of creature + (optionally) spawn weight and max-share columns
-      const listWrap = document.createElement('div');
-      listWrap.className = 'reslist';
-      const rows = [];
-      const addRow = (preset) => {
-        const rr = document.createElement('div');
-        rr.className = 'reslist-row';
-        const combo = makeCombo('dino', 'Creature…');
-        if (preset && preset.c) combo.set(preset.c);
-        rr.appendChild(combo.el);
-        let wInp = null;
-        let pctInp = null;
-        if (f.cols) {
-          wInp = document.createElement('input');
-          wInp.type = 'number';
-          wInp.step = '0.1';
-          wInp.min = 0;
-          wInp.value = preset && preset.w !== undefined ? preset.w : 1;
-          wInp.title = 'Spawn weight — higher = more common';
-          pctInp = document.createElement('input');
-          pctInp.type = 'number';
-          pctInp.step = '0.05';
-          pctInp.min = 0;
-          pctInp.max = 1;
-          pctInp.value = preset && preset.pct ? preset.pct : '';
-          pctInp.placeholder = 'max %';
-          pctInp.title = 'Optional cap: max share of this area (0.25 = 25%)';
-          const wLab = document.createElement('label');
-          wLab.textContent = 'weight';
-          wLab.style.fontSize = '.78rem';
-          rr.append(wLab, wInp, pctInp);
-        }
-        const del = document.createElement('button');
-        del.className = 'btn small';
-        del.innerHTML = uiIcon('x', 13);
-        const entry = { combo, wInp, pctInp, rr };
-        del.addEventListener('click', () => { rr.remove(); rows.splice(rows.indexOf(entry), 1); });
-        rr.appendChild(del);
-        rows.push(entry);
-        listWrap.insertBefore(rr, addBtn);
-      };
-      const addBtn = document.createElement('button');
-      addBtn.className = 'btn small';
-      addBtn.innerHTML = uiIcon('plus', 13) + ' Add creature';
-      addBtn.addEventListener('click', () => addRow());
-      listWrap.appendChild(addBtn);
-      if (editing && Array.isArray(editing[f.k]) && editing[f.k].length) editing[f.k].forEach(addRow);
-      else addRow();
-      controls[f.k] = {
-        get: () => rows
-          .map((r) => ({ c: r.combo.get(), w: r.wInp ? parseFloat(r.wInp.value) || 1 : undefined, pct: r.pctInp ? parseFloat(r.pctInp.value) || 0 : undefined }))
-          .filter((r) => r.c),
-      };
-      fw.appendChild(listWrap);
-    } else if (f.t === 'bool') {
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = editing ? Boolean(editing[f.k]) : Boolean(f.d);
-      lab.prepend(cb);
-      lab.style.cursor = 'pointer';
-      controls[f.k] = { get: () => cb.checked };
-    } else if (f.t === 'reslist') {
-      const resWrap = document.createElement('div');
-      resWrap.className = 'reslist';
-      const rows = [];
-      const addRow = (c, amt) => {
-        const rr = document.createElement('div');
-        rr.className = 'reslist-row';
-        const combo = makeCombo('item', 'Resource…');
-        if (c) combo.set(c);
-        const num = document.createElement('input');
-        num.type = 'number';
-        num.value = amt || 10;
-        num.min = 0;
-        num.title = 'Amount needed';
-        const del = document.createElement('button');
-        del.className = 'btn small';
-        del.innerHTML = uiIcon('x', 13);
-        del.addEventListener('click', () => { rr.remove(); rows.splice(rows.indexOf(entry), 1); });
-        const entry = { combo, num };
-        rows.push(entry);
-        rr.appendChild(combo.el); rr.appendChild(num); rr.appendChild(del);
-        resWrap.insertBefore(rr, addBtn);
-      };
-      const addBtn = document.createElement('button');
-      addBtn.className = 'btn small';
-      addBtn.innerHTML = uiIcon('plus', 13) + ' Add resource';
-      addBtn.addEventListener('click', () => addRow());
-      resWrap.appendChild(addBtn);
-      if (editing && Array.isArray(editing[f.k])) for (const r of editing[f.k]) addRow(r.c, r.amt);
-      else addRow();
-      controls[f.k] = { get: () => rows.map((r) => ({ c: r.combo.get(), amt: parseFloat(r.num.value) || 0 })).filter((r) => r.c) };
-      fw.appendChild(resWrap);
-    } else {
-      const num = document.createElement('input');
-      num.type = 'number';
-      if (f.t === 'float') num.step = '0.1';
-      if (f.ph) num.placeholder = f.ph;
-      if (editing && editing[f.k] !== undefined && editing[f.k] !== '') num.value = editing[f.k];
-      else if (!editing && f.d !== undefined && f.t !== 'bool') num.value = f.d;
-      controls[f.k] = { get: () => (num.value === '' ? '' : (f.t === 'int' ? parseInt(num.value, 10) : parseFloat(num.value))) };
-      fw.appendChild(num);
-    }
-    form.appendChild(fw);
+    const fieldWrap = uiElement('div', { className: 'builder-field', parent: form });
+    const label = uiElement('label', { text: f.n + (f.req ? ' *' : ''), parent: fieldWrap });
+    controls[f.k] = builderFieldControl(f, fieldWrap, label, editing);
   }
-  const rowBtns = document.createElement('div');
+  return { form, controls };
+}
+
+/**
+ * Reads every control into an entry object.
+ * @returns {object|null} null (after a toast) when a required field is blank.
+ */
+function builderCollectEntry(spec, controls) {
+  const v = {};
+  for (const f of spec.fields) {
+    const val = controls[f.k].get();
+    if (f.req && (val === '' || val === undefined || (Array.isArray(val) && !val.length))) {
+      toast(`Please fill in “${f.n.split('(')[0].trim()}”.`);
+      return null;
+    }
+    v[f.k] = val;
+  }
+  return v;
+}
+
+/** Existing list + add/edit form. Re-rendered wholesale after every change. */
+function renderEntriesBuilder() {
+  const { spec, entries } = builderCtx;
+  const body = $('builderBody');
+  body.innerHTML = '';
+  body.appendChild(renderExistingEntries(spec, entries));
+
+  const editing = builderCtx.editIndex >= 0 ? entries[builderCtx.editIndex] : null;
+  const { form, controls } = renderEntryForm(spec, editing);
+
+  const rowBtns = uiElement('div', { parent: form });
   rowBtns.style.cssText = 'display:flex;gap:8px;margin-top:10px';
-  const bSave = document.createElement('button');
-  bSave.className = 'btn primary small';
-  bSave.innerHTML = editing ? uiIcon('save', 14) + ' Save changes' : uiIcon('plus', 14) + ' Add to list';
-  bSave.addEventListener('click', () => {
-    const v = {};
-    for (const f of spec.fields) {
-      const val = controls[f.k].get();
-      if (f.req && (val === '' || val === undefined || (Array.isArray(val) && !val.length))) {
-        toast(`Please fill in “${f.n.split('(')[0].trim()}”.`);
-        return;
-      }
-      v[f.k] = val;
-    }
-    if (editing) builderCtx.entries[builderCtx.editIndex] = v;
-    else builderCtx.entries.push(v);
-    builderCtx.editIndex = -1;
-    saveEntries();
-    renderEntriesBuilder();
-    toast(editing ? 'Entry updated.' : 'Added!');
+  uiButton(rowBtns, {
+    small: true,
+    variant: 'primary',
+    html: editing ? uiIcon('save', 14) + ' Save changes' : uiIcon('plus', 14) + ' Add to list',
+    onClick: () => {
+      const v = builderCollectEntry(spec, controls);
+      if (!v) return;
+      if (editing) builderCtx.entries[builderCtx.editIndex] = v;
+      else builderCtx.entries.push(v);
+      builderCtx.editIndex = -1;
+      saveEntries();
+      renderEntriesBuilder();
+      toast(editing ? 'Entry updated.' : 'Added!');
+    },
   });
-  rowBtns.appendChild(bSave);
   if (editing) {
-    const bCancel = document.createElement('button');
-    bCancel.className = 'btn small';
-    bCancel.textContent = 'Cancel';
-    bCancel.addEventListener('click', () => { builderCtx.editIndex = -1; renderEntriesBuilder(); });
-    rowBtns.appendChild(bCancel);
+    uiButton(rowBtns, {
+      small: true,
+      text: 'Cancel',
+      onClick: () => { builderCtx.editIndex = -1; renderEntriesBuilder(); },
+    });
   }
-  form.appendChild(rowBtns);
   body.appendChild(form);
 }
 
-/* ---------------- level ramp builder ---------------- */
+/* ---------------- level ramp builder ----------------
+   The maths lives in small pure functions so the generated curve can be read
+   (and reasoned about) without wading through the DOM wiring below. */
+
+/** Dino ramps are generated at this share of the player total XP. */
+const RAMP_DINO_XP_SHARE = 0.9;
+
+/**
+ * Cumulative XP thresholds for a level curve. `totalXp` is reached at the top
+ * level; `exponent` shapes the curve (< 2 = fast early levels, > 2 = a steep
+ * grind at the top). Every step is forced at least 1 XP above the previous
+ * one — ARK ignores a ramp that is not strictly increasing.
+ *
+ * @param {number} levels    number of levels, including level 1
+ * @param {number} totalXp   XP needed for the final level
+ * @param {number} exponent  curve shape
+ * @returns {number[]} one threshold per level step (`levels - 1` of them)
+ */
+function rampCurveValues(levels, totalXp, exponent) {
+  const values = [];
+  let prev = 0;
+  for (let i = 1; i <= levels - 1; i++) {
+    let xp = Math.round(totalXp * Math.pow(i / (levels - 1), exponent));
+    if (!Number.isFinite(xp) || xp <= prev) xp = prev + 1;
+    values.push(xp);
+    prev = xp;
+  }
+  return values;
+}
+
+/** One `LevelExperienceRampOverrides` line for a set of thresholds. */
+function rampLine(values) {
+  return '(' + values.map((xp, idx) => `ExperiencePointsForLevel[${idx}]=${xp}`).join(',') + ')';
+}
+
+/**
+ * Reads the ramp form into plain numbers.
+ * @returns {object|null} null when the level/XP boxes are unusable.
+ */
+function rampFormValues() {
+  const pMax = builderInteger($('rampPMax').value, 0);
+  const pXp = builderInteger($('rampPXp').value, 0);
+  if (!(pMax > 1) || !(pXp > 0)) return null;
+  return {
+    pMax,
+    pXp,
+    exponent: builderNumber($('rampShape').value, 2),
+    dino: $('rampDino').checked,
+    dMax: builderInteger($('rampDMax').value, 88),
+    setMax: $('rampSetMax').checked,
+  };
+}
+
+/** Three sample levels, so the shape of the curve is visible before it is used. */
+function rampPreviewText(form) {
+  const sample = [1, Math.round(form.pMax / 2), form.pMax - 1].map((lv) => {
+    const xp = Math.round(form.pXp * Math.pow(lv / (form.pMax - 1), form.exponent));
+    return `Level ${lv + 1}: ${xp.toLocaleString()} XP total`;
+  });
+  return `Generated ${form.pMax - 1} player level steps${form.dino ? ' + dino levels' : ''}:\n` + sample.join('\n');
+}
+
+/** Writes the generated ramp — and, optionally, the matching XP caps. */
+function applyRampCurve(form) {
+  const dinoXp = Math.round(form.pXp * RAMP_DINO_XP_SHARE);
+  const lines = [rampLine(rampCurveValues(form.pMax, form.pXp, form.exponent))];
+  if (form.dino) lines.push(rampLine(rampCurveValues(form.dMax + 1, dinoXp, form.exponent)));
+  builderCtx.textarea.value = lines.join('\n');
+  builderCtx.textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  if (form.setMax) {
+    /* A ramp above the max-XP override is silently capped in game, so the two
+       settings are kept in step unless the user opts out. */
+    const optPlayer = OPTIONS.find((o) => o.k === 'OverrideMaxExperiencePointsPlayer');
+    const optDino = OPTIONS.find((o) => o.k === 'OverrideMaxExperiencePointsDino');
+    if (optPlayer) setValSilent(optPlayer, form.pXp + 1);
+    if (optDino && form.dino) setValSilent(optDino, dinoXp + 1);
+    saveState();
+    refreshBadges();
+  }
+}
+
 function renderRampBuilder() {
   const body = $('builderBody');
   const existing = builderCtx.textarea.value.split(/\r?\n/).filter((l) => l.trim());
@@ -645,58 +905,73 @@ function renderRampBuilder() {
   $('rampGen').innerHTML = uiIcon('bolt', 14) + ' Generate level curve';
   $('rampDino').addEventListener('change', () => { $('rampDinoWrap').style.display = $('rampDino').checked ? '' : 'none'; });
   $('rampGen').addEventListener('click', () => {
-    const pMax = parseInt($('rampPMax').value, 10);
-    const pXp = parseInt($('rampPXp').value, 10);
-    const exp = parseFloat($('rampShape').value);
-    if (!(pMax > 1) || !(pXp > 0)) { toast('Enter a max level and total XP first.'); return; }
-    const makeRamp = (levels, totalXp) => {
-      const vals = [];
-      let prev = 0;
-      for (let i = 1; i <= levels - 1; i++) {
-        let xp = Math.round(totalXp * Math.pow(i / (levels - 1), exp));
-        if (xp <= prev) xp = prev + 1;
-        vals.push(xp);
-        prev = xp;
-      }
-      return '(' + vals.map((x, idx) => `ExperiencePointsForLevel[${idx}]=${x}`).join(',') + ')';
-    };
-    const lines = [makeRamp(pMax, pXp)];
-    if ($('rampDino').checked) {
-      const dMax = parseInt($('rampDMax').value, 10) || 88;
-      lines.push(makeRamp(dMax + 1, Math.round(pXp * 0.9)));
-    }
-    builderCtx.textarea.value = lines.join('\n');
-    builderCtx.textarea.dispatchEvent(new Event('input', { bubbles: true }));
-    if ($('rampSetMax').checked) {
-      const oP = OPTIONS.find((o) => o.k === 'OverrideMaxExperiencePointsPlayer');
-      const oD = OPTIONS.find((o) => o.k === 'OverrideMaxExperiencePointsDino');
-      if (oP) setValSilent(oP, pXp + 1);
-      if (oD && $('rampDino').checked) setValSilent(oD, Math.round(pXp * 0.9) + 1);
-      saveState(); refreshBadges();
-    }
-    const pv = $('rampPreview');
-    const sample = [1, Math.round(pMax / 2), pMax - 1].map((lv) => {
-      const xp = Math.round(pXp * Math.pow(lv / (pMax - 1), exp));
-      return `Level ${lv + 1}: ${xp.toLocaleString()} XP total`;
-    });
-    pv.textContent = `Generated ${pMax - 1} player level steps${$('rampDino').checked ? ' + dino levels' : ''}:\n` + sample.join('\n');
-    pv.style.display = '';
+    const form = rampFormValues();
+    if (!form) { toast('Enter a max level and total XP first.'); return; }
+    applyRampCurve(form);
+    const preview = $('rampPreview');
+    preview.textContent = rampPreviewText(form);
+    preview.style.display = '';
     toast('Level curve generated and applied!');
   });
 }
 
 /* ---------------- engram points builder ---------------- */
+
+/** Shown when the option is still empty: official-ish 8 points per level. */
+const POINTS_FALLBACK_RANGE = { from: 2, to: 105, pts: 8 };
+
+/**
+ * Compresses the existing "one number per level" lines back into editable
+ * ranges. Levels start at 2, so line index 0 is level 2.
+ *
+ * @param {string} text raw textarea contents
+ * @returns {{from: number, to: number, pts: number}[]} never empty
+ */
+function pointsRangesFromText(text) {
+  const nums = text.split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => builderInteger(l.replace(/^.*=/, ''), null))
+    .filter((n) => n !== null);
+  const ranges = [];
+  nums.forEach((pts, i) => {
+    const last = ranges[ranges.length - 1];
+    if (last && last.pts === pts) last.to = i + 2;
+    else ranges.push({ from: i + 2, to: i + 2, pts });
+  });
+  return ranges.length ? ranges : [{ ...POINTS_FALLBACK_RANGE }];
+}
+
+/**
+ * One points value per level, rows applied in listed order so a later row
+ * deliberately overrides an overlapping earlier one (e.g. 2–60 = 8, then
+ * 10–20 = 20 boosts just the middle). Levels no range covers give 0.
+ *
+ * @param {{from: HTMLInputElement, to: HTMLInputElement, pts: HTMLInputElement}[]} rowRefs
+ * @returns {Map<number, number>} level → points
+ */
+function pointsByLevel(rowRefs) {
+  const byLevel = new Map();
+  for (const r of rowRefs) {
+    const from = builderInteger(r.from.value, 0);
+    const to = builderInteger(r.to.value, 0);
+    const pts = builderInteger(r.pts.value, -1);
+    if (from >= 2 && to >= from && pts >= 0) for (let lv = from; lv <= to; lv++) byLevel.set(lv, pts);
+  }
+  return byLevel;
+}
+
+/** The written form: level 2 upwards, one number per line, gaps filled with 0. */
+function pointsLines(byLevel) {
+  const maxLv = Math.max(...byLevel.keys());
+  const lines = [];
+  for (let lv = 2; lv <= maxLv; lv++) lines.push(String(byLevel.get(lv) ?? 0));
+  return lines;
+}
+
 function renderPointsBuilder() {
   const body = $('builderBody');
-  // compress existing lines into ranges
-  const nums = builderCtx.textarea.value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).map((l) => parseInt(l.replace(/^.*=/, ''), 10)).filter((n) => !isNaN(n));
-  const ranges = [];
-  for (let i = 0; i < nums.length; i++) {
-    const last = ranges[ranges.length - 1];
-    if (last && last.pts === nums[i]) last.to = i + 2;
-    else ranges.push({ from: i + 2, to: i + 2, pts: nums[i] });
-  }
-  if (!ranges.length) ranges.push({ from: 2, to: 105, pts: 8 });
+  const ranges = pointsRangesFromText(builderCtx.textarea.value);
 
   body.innerHTML = `
     <p class="opt-help">How many engram points players get at each level. Work in ranges — e.g. levels 2–20 give 8 points each,
@@ -713,55 +988,45 @@ function renderPointsBuilder() {
   $('epApply').innerHTML = uiIcon('bolt', 14) + ' Apply';
   const wrap = $('epRanges');
   const rowRefs = [];
-  const addRange = (r) => {
-    const row = document.createElement('div');
-    row.className = 'reslist-row';
-    row.innerHTML = `<label style="font-size:.85rem">Levels</label>`;
-    const from = document.createElement('input'); from.type = 'number'; from.value = r.from; from.min = 2;
-    const dash = document.createElement('span'); dash.textContent = '–';
-    const to = document.createElement('input'); to.type = 'number'; to.value = r.to; to.min = 2;
-    const lab = document.createElement('label'); lab.textContent = 'get'; lab.style.fontSize = '.85rem';
-    const pts = document.createElement('input'); pts.type = 'number'; pts.value = r.pts; pts.min = 0;
-    const lab2 = document.createElement('label'); lab2.textContent = 'points each'; lab2.style.fontSize = '.85rem';
-    const del = document.createElement('button'); del.className = 'btn small'; del.innerHTML = uiIcon('x', 13);
-    const ref = { from, to, pts, row };
-    del.addEventListener('click', () => { row.remove(); rowRefs.splice(rowRefs.indexOf(ref), 1); updTotal(); });
-    [from, to, pts].forEach((i) => i.addEventListener('input', updTotal));
-    row.append(from, dash, to, lab, pts, lab2, del);
-    wrap.appendChild(row);
-    rowRefs.push(ref);
-  };
-  /* One points value per level, rows applied in listed order so a later row
-     deliberately overrides an overlapping earlier one (e.g. 2–60 = 8, then
-     10–20 = 20 boosts just the middle). Levels no range covers give 0. */
-  const pointsByLevel = () => {
-    const byLevel = new Map();
-    for (const r of rowRefs) {
-      const f = parseInt(r.from.value, 10), t = parseInt(r.to.value, 10), p = parseInt(r.pts.value, 10);
-      if (f >= 2 && t >= f && p >= 0) for (let lv = f; lv <= t; lv++) byLevel.set(lv, p);
-    }
-    return byLevel;
-  };
+
   const updTotal = () => {
-    const byLevel = pointsByLevel();
+    const byLevel = pointsByLevel(rowRefs);
     let total = 0;
     for (const p of byLevel.values()) total += p;
     $('epTotal').textContent = byLevel.size ? `${byLevel.size} levels · ${total.toLocaleString()} engram points in total` : '';
   };
+
+  const addRange = (r) => {
+    const row = uiElement('div', { className: 'reslist-row', html: '<label style="font-size:.85rem">Levels</label>', parent: wrap });
+    const from = document.createElement('input'); from.type = 'number'; from.value = r.from; from.min = 2;
+    const dash = uiElement('span', { text: '–' });
+    const to = document.createElement('input'); to.type = 'number'; to.value = r.to; to.min = 2;
+    const lab = uiElement('label', { text: 'get' }); lab.style.fontSize = '.85rem';
+    const pts = document.createElement('input'); pts.type = 'number'; pts.value = r.pts; pts.min = 0;
+    const lab2 = uiElement('label', { text: 'points each' }); lab2.style.fontSize = '.85rem';
+    row.append(from, dash, to, lab, pts, lab2);
+    const ref = { from, to, pts, row };
+    uiButton(row, {
+      small: true, html: uiIcon('x', 13), title: 'Remove range',
+      onClick: () => { row.remove(); rowRefs.splice(rowRefs.indexOf(ref), 1); updTotal(); },
+    });
+    [from, to, pts].forEach((i) => i.addEventListener('input', updTotal));
+    rowRefs.push(ref);
+  };
+
   ranges.forEach(addRange);
   updTotal();
+
   $('epAdd').addEventListener('click', () => {
     const last = rowRefs[rowRefs.length - 1];
-    const start = last ? (parseInt(last.to.value, 10) || 2) + 1 : 2;
+    const start = last ? builderInteger(last.to.value, 2) + 1 : 2;
     addRange({ from: start, to: start + 10, pts: 12 });
     updTotal();
   });
   $('epApply').addEventListener('click', () => {
-    const byLevel = pointsByLevel();
+    const byLevel = pointsByLevel(rowRefs);
     if (!byLevel.size) { toast('Add at least one level range first.'); return; }
-    const maxLv = Math.max(...byLevel.keys());
-    const lines = [];
-    for (let lv = 2; lv <= maxLv; lv++) lines.push(String(byLevel.get(lv) ?? 0));
+    const lines = pointsLines(byLevel);
     builderCtx.textarea.value = lines.join('\n');
     builderCtx.textarea.dispatchEvent(new Event('input', { bubbles: true }));
     toast(`Engram points set for ${lines.length} levels!`);

@@ -42,13 +42,22 @@ npm start
 Useful commands:
 
 ```powershell
-npm run smoke   # Desktop smoke test
-npm run legal   # Regenerate legal documents
-npm run dist    # Build the Windows NSIS installer
+npm run lint            # ESLint
+npm run check:globals   # Renderer global-scope collision check
+npm run smoke           # Desktop smoke test
+npm run verify          # All three of the above
+npm run legal           # Regenerate legal documents
+npm run dist            # Build the Windows NSIS installer
 ```
+
+The renderer has no bundler: every `<script>` in `index.html` shares one global
+scope, so two files declaring the same top-level name is a `SyntaxError` that
+stops the app booting. `npm run check:globals` catches that; ESLint cannot.
+Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing renderer files.
 
 ## Documentation
 
+- [Architecture](docs/ARCHITECTURE.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)

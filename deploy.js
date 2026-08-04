@@ -15,11 +15,61 @@
    ========================================================================= */
 'use strict';
 
-const CONFIG_FILES = ['GameUserSettings.ini', 'Game.ini'];
-const SELFHOSTED_CONFIG_PATH = ['ShooterGame', 'Saved', 'Config', 'WindowsServer'];
+/* The two files we read and write, and where they live on a server — both come
+   from constants.js so the deploy layer, the main process and the local-server
+   helper can never disagree about a name or a path. */
+const CONFIG_FILES = [ASA_SERVER.FILES.GAME_USER_SETTINGS, ASA_SERVER.FILES.GAME];
+
+/* The tail of the config path ("…/Config/WindowsServer"): if the user picked
+   one of these folders directly there is nothing left to walk down. */
+const CONFIG_FOLDER_NAMES = ASA_SERVER.CONFIG_PARTS.slice(-2);
 
 let deployInFlight = false;              // one operation at a time, app-wide
-const deployLogLines = new Map();        // profileId -> log lines (survive re-renders)
+const DEPLOY_LOG_LINES = 200;
+const deployLogLines = new Map();        // profileId -> log buffer (survives re-renders)
+
+/** The log buffer for a profile, created on first use. */
+function deployLogBuffer(profileId) {
+  let buffer = deployLogLines.get(profileId);
+  if (!buffer) {
+    buffer = createLogBuffer({ limit: DEPLOY_LOG_LINES });
+    deployLogLines.set(profileId, buffer);
+  }
+  return buffer;
+}
+
+/* ---------------------------------------------------------------------------
+   Network failure reporting.
+
+   `fetch` rejects with the same opaque TypeError whether the machine is
+   offline, DNS failed, the certificate is bad or the response lacked CORS
+   headers. Reporting all of them as "the panel blocks CORS" sent users chasing
+   the wrong problem, so distinguish everything the browser does tell us and
+   only mention CORS as one candidate of several.
+   --------------------------------------------------------------------------- */
+
+/**
+ * @param {unknown} error the rejection from `fetch`
+ * @param {string} url    the URL we tried to reach
+ * @param {string} what   human name of the target, e.g. 'the panel'
+ */
+function describeFetchFailure(error, url, what) {
+  const name = error && error.name;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return 'This PC is offline — reconnect and try again.';
+  }
+  if (name === 'AbortError' || name === 'TimeoutError') {
+    return `${what} did not answer in time — it may be slow or down right now.`;
+  }
+  if (typeof location !== 'undefined' && location.protocol === 'https:' && /^http:\/\//i.test(String(url))) {
+    return `${what} is served over plain http://, which this page is not allowed to contact. Use its https:// address.`;
+  }
+  if (name === 'TypeError') {
+    return `Could not reach ${what} at all. The address may be wrong or the host down (DNS), its certificate may not be trusted (HTTPS),`
+      + ` or it may refuse cross-site access from a browser (CORS). If this keeps failing, use Create Files and upload the files yourself.`;
+  }
+  return `Could not reach ${what}: ${(error && error.message) || 'unknown error'}`;
+}
 
 /* ---------------- state ---------------- */
 function deployState() {
@@ -52,10 +102,16 @@ function newProfileId() {
 /* ---------------- provider: Nitrado ---------------- */
 const nitrado = {
   async api(token, path, options = {}) {
-    const resp = await fetch('https://api.nitrado.net' + path, {
-      ...options,
-      headers: { Authorization: 'Bearer ' + token, ...(options.headers || {}) },
-    });
+    const url = 'https://api.nitrado.net' + path;
+    let resp;
+    try {
+      resp = await fetch(url, {
+        ...options,
+        headers: { Authorization: 'Bearer ' + token, ...(options.headers || {}) },
+      });
+    } catch (e) {
+      throw new Error(describeFetchFailure(e, url, 'Nitrado'));
+    }
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.message || ('Nitrado error ' + resp.status));
     return body.data || {};
@@ -73,7 +129,7 @@ const nitrado = {
     const gs = data.gameserver || {};
     const base = (gs.game_specific && gs.game_specific.path) || '';
     if (!base) throw new Error('Could not find the server file path — is this an ARK: Survival Ascended server?');
-    return base.replace(/\/+$/, '') + '/ShooterGame/Saved/Config/WindowsServer';
+    return base.replace(/\/+$/, '') + ASA_CONFIG_POSIX_PATH;
   },
 
   async readFile(cfg, dir, name) {
@@ -120,7 +176,7 @@ const pterodactyl = {
         },
       });
     } catch (e) {
-      throw new Error('Could not reach the panel from your browser. Many Pterodactyl panels block cross-site access (CORS) — if this keeps failing, use Create Files and upload via the panel instead.');
+      throw new Error(describeFetchFailure(e, base + path, 'the panel'));
     }
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
@@ -137,7 +193,7 @@ const pterodactyl = {
   },
 
   configDir(cfg) {
-    return (cfg.configDir || '/ShooterGame/Saved/Config/WindowsServer').replace(/\/+$/, '');
+    return (cfg.configDir || ASA_CONFIG_POSIX_PATH).replace(/\/+$/, '');
   },
 
   async readFile(cfg, dir, name) {
@@ -167,18 +223,43 @@ const selfhosted = {
   supported: () => typeof window.showDirectoryPicker === 'function',
   handles: new Map(),   // profileId -> directory handle; persisted in IndexedDB below
 
-  async idb(mode, key, value) {
-    return new Promise((resolve, reject) => {
-      const open = indexedDB.open('arkcc-deploy', 1);
-      open.onupgradeneeded = () => open.result.createObjectStore('handles');
-      open.onerror = () => reject(open.error);
-      open.onsuccess = () => {
-        const tx = open.result.transaction('handles', mode === 'get' ? 'readonly' : 'readwrite');
-        const store = tx.objectStore('handles');
-        const req = mode === 'get' ? store.get(key) : store.put(value, key);
-        req.onerror = () => reject(req.error);
-        req.onsuccess = () => resolve(req.result);
+  /* One connection for the whole session. Every call used to open its own,
+     and none of them were ever closed, so a long session leaked a connection
+     per read/write and blocked any later version upgrade. */
+  dbPromise: null,
+
+  openDb() {
+    if (this.dbPromise) return this.dbPromise;
+    this.dbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open('arkcc-deploy', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('handles');
+      request.onerror = () => { this.dbPromise = null; reject(request.error); };
+      request.onsuccess = () => {
+        const db = request.result;
+        // if the connection is closed under us (or another tab upgrades the
+        // schema), drop the cache so the next call reopens
+        db.onclose = () => { this.dbPromise = null; };
+        db.onversionchange = () => { this.dbPromise = null; db.close(); };
+        resolve(db);
       };
+    });
+    return this.dbPromise;
+  },
+
+  closeDb() {
+    const pending = this.dbPromise;
+    this.dbPromise = null;
+    if (pending) pending.then((db) => db.close()).catch(() => { /* never opened */ });
+  },
+
+  async idb(mode, key, value) {
+    const db = await this.openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('handles', mode === 'get' ? 'readonly' : 'readwrite');
+      const store = tx.objectStore('handles');
+      const req = mode === 'get' ? store.get(key) : store.put(value, key);
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => resolve(req.result);
     });
   },
 
@@ -215,12 +296,19 @@ const selfhosted = {
     const root = await this.restoreHandle(profile.id);
     if (!root) throw new Error('No server folder chosen yet — click "Choose server folder" first.');
     try {
-      await root.getFileHandle('GameUserSettings.ini');
+      await root.getFileHandle(ASA_SERVER.FILES.GAME_USER_SETTINGS);
       return root;
-    } catch (e) { /* no config file here (yet) */ }
-    if (root.name === 'WindowsServer' || root.name === 'Config') return root;
+    } catch (e) {
+      // NotFoundError means "this is not the config folder", which is normal
+      // and we go looking below. Anything else — above all a revoked or denied
+      // permission — is a real failure and must not masquerade as one.
+      if (e && e.name !== 'NotFoundError' && e.name !== 'TypeMismatchError') {
+        throw new Error(`Could not read the chosen folder (${e.name || 'error'}: ${e.message}). Re-pick the server folder to grant access again.`);
+      }
+    }
+    if (CONFIG_FOLDER_NAMES.includes(root.name)) return root;
     let dir = root;
-    for (const part of SELFHOSTED_CONFIG_PATH) dir = await dir.getDirectoryHandle(part, { create: forWrite });
+    for (const part of ASA_SERVER.CONFIG_PARTS) dir = await dir.getDirectoryHandle(part, { create: forWrite });
     return dir;
   },
 
@@ -296,18 +384,19 @@ async function deployReadConfig(profile, log) {
 
 async function deployWriteConfig(profile, log) {
   const files = {
-    'GameUserSettings.ini': buildIniFile('gus', false),
-    'Game.ini': buildIniFile('game', false),
+    [ASA_SERVER.FILES.GAME_USER_SETTINGS]: buildIniFile('gus', false),
+    [ASA_SERVER.FILES.GAME]: buildIniFile('game', false),
   };
   const dir = await providerDir(profile);
 
   // back up each file independently — one missing file on the server must not
   // cancel the backup of the other
   for (const name of CONFIG_FILES) {
+    const backupName = name + ASA_SERVER.BACKUP_SUFFIX;
     try {
       const current = await providerReadFile(profile, dir, name);
-      log(`Backing up ${name} → ${name}.bak…`);
-      await providerWriteFile(profile, dir, name + '.bak', current);
+      log(`Backing up ${name} → ${backupName}…`);
+      await providerWriteFile(profile, dir, backupName, current);
     } catch (e) {
       log(`No backup for ${name} (${e.message})`);
     }
@@ -354,82 +443,59 @@ function renderDeployCategory(grid) {
   grid.appendChild(deployNewConnectionCard());
 }
 
+/* One saved connection: the card markup, then the three things it can do.
+   Each flow lives in its own function so the shared busy-guard below stays
+   small enough to be obviously correct. */
 function deployProfileCard(profile) {
-  const provider = DEPLOY_PROVIDERS[profile.provider];
-  const d = deployState();
-  const card = document.createElement('div');
-  card.className = 'opt-card wide selected-mod-row';
-  card.innerHTML = `
-    <div class="mod-thumb mod-thumb-fallback">${uiIcon(provider.icon, 24)}</div>
-    <div style="flex:1;min-width:0">
-      <div class="opt-name">${esc(profile.name)} <span class="mod-badge">${esc(provider.name)}</span>
-        ${d.activeId === profile.id ? '<span class="mod-badge has-ini">active</span>' : ''}</div>
-      <code class="opt-key">${esc(profileSummary(profile))}</code>
-      <pre class="deploy-log" hidden></pre>
-    </div>
-    <div class="mod-row-btns"></div>`;
+  const card = deployProfileCardShell(profile);
   const logEl = card.querySelector('.deploy-log');
-  // logs survive re-renders: keep the lines in a module map and restore them
-  // whenever this profile's card is rebuilt
-  const savedLog = deployLogLines.get(profile.id);
-  if (savedLog && savedLog.length) {
-    logEl.hidden = false;
-    logEl.textContent = savedLog.join('\n');
-  }
-  const log = (msg) => {
-    const lines = deployLogLines.get(profile.id) || [];
-    lines.push(msg);
-    deployLogLines.set(profile.id, lines);
-    logEl.hidden = false;
-    logEl.textContent = lines.join('\n');
-    logEl.scrollTop = logEl.scrollHeight;
-  };
-  const busy = async (btn, fn) => {
+  const btns = card.querySelector('.mod-row-btns');
+
+  // logs survive re-renders: the lines live in a module-level buffer and are
+  // repainted whenever this profile's card is rebuilt
+  const buffer = deployLogBuffer(profile.id);
+  if (!buffer.isEmpty()) buffer.paint(logEl);
+  const log = (msg) => { buffer.push(msg); buffer.paint(logEl); };
+
+  /* Runs one deploy operation, app-wide exclusive.
+     The in-flight flag and the button MUST be released in a `finally`: they
+     used to be reset after the try/catch, so anything that threw outside the
+     inner catch (a confirm() in a closed window, a render error) left
+     deployInFlight stuck true and blocked every deploy for the rest of the
+     session. */
+  const runExclusive = async (button, work) => {
     if (deployInFlight) { toast('A deploy operation is already running — wait for it to finish.'); return; }
     deployInFlight = true;
-    deployLogLines.set(profile.id, []);
+    buffer.clear();
     logEl.textContent = '';
-    btn.disabled = true;
-    try { await fn(); } catch (e) { log('Failed: ' + e.message); }
-    btn.disabled = false;
-    deployInFlight = false;
-    refreshBadges();
+    try {
+      await withBusyButton(button, work);
+    } catch (e) {
+      log('Failed: ' + e.message);
+    } finally {
+      deployInFlight = false;
+      refreshBadges();
+    }
   };
 
-  const btns = card.querySelector('.mod-row-btns');
-  const add = (html, title, cls, fn) => {
-    const b = document.createElement('button');
-    b.className = 'btn small' + (cls ? ' ' + cls : '');
-    b.innerHTML = html;
-    b.title = title;
-    b.addEventListener('click', fn);
-    btns.appendChild(b);
-    return b;
-  };
-
-  const readBtn = add(uiIcon('download', 14) + ' Read', 'Load this server\'s current settings into the tool', '', () =>
-    busy(readBtn, async () => {
-      // reading merges the server's files over whatever is set up locally —
-      // warn before touching a setup the user has been working on
-      const hasLocalWork = Object.keys(state.opts).length > 0 || (state.mods || []).length > 0;
-      if (hasLocalWork && !confirm(`Read the config from "${profile.name}"?\nThe server's settings will be merged over your current setup here. Tip: save a profile first (Presets → Save my setup) if you want a backup.`)) return;
-      deployState().activeId = profile.id;
-      saveState();
-      await deployReadConfig(profile, log);
-    }));
-  const deployBtn = add(uiIcon('upload', 14) + ' Deploy', 'Write this tool\'s settings to the server', 'primary', () =>
-    busy(deployBtn, async () => {
-      if (!confirm(`Deploy the current settings to "${profile.name}"?\nThe server's existing files are backed up as .bak first.`)) return;
-      deployState().activeId = profile.id;
-      saveState();
-      await deployWriteConfig(profile, log);
-    }));
-  add(uiIcon('x', 14), 'Delete this connection', '', () => {
-    if (!confirm(`Delete the connection "${profile.name}"?`)) return;
-    if (profile.provider === 'selfhosted') selfhosted.forget(profile.id);
-    deployLogLines.delete(profile.id);
-    deleteProfile(profile.id);
-    render();
+  const readBtn = uiButton(btns, {
+    small: true,
+    html: uiIcon('download', 14) + ' Read',
+    title: 'Load this server\'s current settings into the tool',
+    onClick: () => runExclusive(readBtn, () => deployReadFlow(profile, log)),
+  });
+  const deployBtn = uiButton(btns, {
+    small: true,
+    variant: 'primary',
+    html: uiIcon('upload', 14) + ' Deploy',
+    title: 'Write this tool\'s settings to the server',
+    onClick: () => runExclusive(deployBtn, () => deployWriteFlow(profile, log)),
+  });
+  uiButton(btns, {
+    small: true,
+    html: uiIcon('x', 14),
+    title: 'Delete this connection',
+    onClick: () => deployDeleteFlow(profile),
   });
 
   if (DEPLOY_PROVIDERS[profile.provider].canRestart) {
@@ -449,6 +515,49 @@ function deployProfileCard(profile) {
     btns.appendChild(lab);
   }
   return card;
+}
+
+/** The static markup of a connection card: identity, summary and empty log. */
+function deployProfileCardShell(profile) {
+  const provider = DEPLOY_PROVIDERS[profile.provider];
+  const isActive = deployState().activeId === profile.id;
+  const card = document.createElement('div');
+  card.className = 'opt-card wide selected-mod-row';
+  card.innerHTML = `
+    <div class="mod-thumb mod-thumb-fallback">${uiIcon(provider.icon, 24)}</div>
+    <div style="flex:1;min-width:0">
+      <div class="opt-name">${esc(profile.name)} <span class="mod-badge">${esc(provider.name)}</span>
+        ${isActive ? '<span class="mod-badge has-ini">active</span>' : ''}</div>
+      <code class="opt-key">${esc(profileSummary(profile))}</code>
+      <pre class="deploy-log" hidden></pre>
+    </div>
+    <div class="mod-row-btns"></div>`;
+  return card;
+}
+
+/* Reading merges the server's files over whatever is set up locally — warn
+   before touching a setup the user has been working on. */
+async function deployReadFlow(profile, log) {
+  const hasLocalWork = Object.keys(state.opts).length > 0 || (state.mods || []).length > 0;
+  if (hasLocalWork && !confirm(`Read the config from "${profile.name}"?\nThe server's settings will be merged over your current setup here. Tip: save a profile first (Presets → Save my setup) if you want a backup.`)) return;
+  deployState().activeId = profile.id;
+  saveState();
+  await deployReadConfig(profile, log);
+}
+
+async function deployWriteFlow(profile, log) {
+  if (!confirm(`Deploy the current settings to "${profile.name}"?\nThe server's existing files are backed up as ${ASA_SERVER.BACKUP_SUFFIX} first.`)) return;
+  deployState().activeId = profile.id;
+  saveState();
+  await deployWriteConfig(profile, log);
+}
+
+function deployDeleteFlow(profile) {
+  if (!confirm(`Delete the connection "${profile.name}"?`)) return;
+  if (profile.provider === 'selfhosted') selfhosted.forget(profile.id);
+  deployLogLines.delete(profile.id);
+  deleteProfile(profile.id);
+  render();
 }
 
 function profileSummary(profile) {
@@ -504,50 +613,32 @@ function deployNewConnectionCard() {
   return card;
 }
 
-function deployField(parent, label, placeholder, type) {
-  const fw = document.createElement('div');
-  fw.className = 'builder-field';
-  const lab = document.createElement('label');
-  lab.textContent = label;
-  const inp = document.createElement('input');
-  inp.type = type || 'text';
-  inp.placeholder = placeholder || '';
-  inp.autocomplete = 'off';
-  fw.append(lab, inp);
-  parent.appendChild(fw);
-  return inp;
-}
-function deployButton(parent, html, primary, fn) {
-  const b = document.createElement('button');
-  b.className = 'btn small' + (primary ? ' primary' : '');
-  b.innerHTML = html;
-  b.addEventListener('click', fn);
-  parent.appendChild(b);
-  return b;
-}
+/* A one-line status message under a form, returned as a setter. */
 function deployStatus(parent) {
-  const el = document.createElement('p');
-  el.className = 'opt-help';
-  parent.appendChild(el);
+  const el = uiStatusLine(parent, '');
   return (msg) => { el.textContent = msg; };
 }
 
+/** The `.btn small` used throughout the connection forms. */
+function deployActionButton(parent, html, primary, onClick) {
+  return uiButton(parent, { small: true, variant: primary ? 'primary' : '', html, onClick });
+}
+
 function deployNitradoFields(wrap) {
-  const token = deployField(wrap, 'Nitrado API token (Long Life Token)', 'paste your token…', 'password');
-  const nameInp = deployField(wrap, 'Connection name', 'e.g. My Island server');
+  const token = uiField(wrap, { label: 'Nitrado API token (Long Life Token)', placeholder: 'paste your token…', type: 'password' });
+  const nameInp = uiField(wrap, { label: 'Connection name', placeholder: 'e.g. My Island server' });
   const row = document.createElement('div');
   row.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap';
   wrap.appendChild(row);
   const status = deployStatus(wrap);
   let serverSel = null;
 
-  deployButton(row, uiIcon('search', 14) + ' Load my servers', false, async function () {
+  const loadBtn = deployActionButton(row, uiIcon('search', 14) + ' Load my servers', false, () => withBusyButton(loadBtn, async () => {
     if (!token.value.trim()) { status('Paste your Nitrado token first.'); return; }
-    this.disabled = true;
     status('Asking Nitrado for your servers…');
     try {
       const servers = await nitrado.listGameservers(token.value.trim());
-      if (!servers.length) { status('No gameservers found on this account.'); this.disabled = false; return; }
+      if (!servers.length) { status('No gameservers found on this account.'); return; }
       if (serverSel) serverSel.remove();
       serverSel = document.createElement('select');
       for (const s of servers) {
@@ -559,11 +650,10 @@ function deployNitradoFields(wrap) {
       row.insertBefore(serverSel, row.children[1] || null);
       status(`Found ${servers.length} server${servers.length === 1 ? '' : 's'} — pick one and save.`);
     } catch (e) { status('Failed: ' + e.message); }
-    this.disabled = false;
-  });
+  }));
 
-  deployButton(row, uiIcon('save', 14) + ' Save connection', true, () => {
-    if (!token.value.trim() || !serverSel) { deployStatusToast('Load your servers and pick one first.'); return; }
+  deployActionButton(row, uiIcon('save', 14) + ' Save connection', true, () => {
+    if (!token.value.trim() || !serverSel) { toast('Load your servers and pick one first.'); return; }
     saveProfile({
       id: newProfileId(),
       name: nameInp.value.trim() || serverSel.selectedOptions[0].textContent,
@@ -576,18 +666,17 @@ function deployNitradoFields(wrap) {
 }
 
 function deployPterodactylFields(wrap) {
-  const panel = deployField(wrap, 'Panel URL', 'e.g. https://panel.legion-hosting.com');
-  const key = deployField(wrap, 'Client API key', 'ptlc_…', 'password');
-  const server = deployField(wrap, 'Server ID', 'e.g. a1b2c3d4 (from the panel URL or via Load)');
-  const dir = deployField(wrap, 'Config folder on the server', '/ShooterGame/Saved/Config/WindowsServer');
-  const nameInp = deployField(wrap, 'Connection name', 'e.g. Legion ASA server');
+  const panel = uiField(wrap, { label: 'Panel URL', placeholder: 'e.g. https://panel.legion-hosting.com' });
+  const key = uiField(wrap, { label: 'Client API key', placeholder: 'ptlc_…', type: 'password' });
+  const server = uiField(wrap, { label: 'Server ID', placeholder: 'e.g. a1b2c3d4 (from the panel URL or via Load)' });
+  const dir = uiField(wrap, { label: 'Config folder on the server', placeholder: ASA_CONFIG_POSIX_PATH });
+  const nameInp = uiField(wrap, { label: 'Connection name', placeholder: 'e.g. Legion ASA server' });
   const row = document.createElement('div');
   row.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap';
   wrap.appendChild(row);
   const status = deployStatus(wrap);
 
-  deployButton(row, uiIcon('search', 14) + ' Load my servers', false, async function () {
-    this.disabled = true;
+  const loadBtn = deployActionButton(row, uiIcon('search', 14) + ' Load my servers', false, () => withBusyButton(loadBtn, async () => {
     status('Asking the panel for your servers…');
     try {
       const servers = await pterodactyl.listServers({ panelUrl: panel.value.trim(), apiKey: key.value.trim() });
@@ -595,10 +684,9 @@ function deployPterodactylFields(wrap) {
         ? 'Servers: ' + servers.map((s) => s.label).join(' · ') + ' — paste the ID you want above.'
         : 'The panel returned no servers for this key.');
     } catch (e) { status(e.message); }
-    this.disabled = false;
-  });
+  }));
 
-  deployButton(row, uiIcon('save', 14) + ' Save connection', true, () => {
+  deployActionButton(row, uiIcon('save', 14) + ' Save connection', true, () => {
     if (!panel.value.trim() || !key.value.trim() || !server.value.trim()) { status('Panel URL, API key and server ID are all needed.'); return; }
     saveProfile({
       id: newProfileId(),
@@ -608,7 +696,7 @@ function deployPterodactylFields(wrap) {
         panelUrl: panel.value.trim(),
         apiKey: key.value.trim(),
         serverId: server.value.trim(),
-        configDir: dir.value.trim() || '/ShooterGame/Saved/Config/WindowsServer',
+        configDir: dir.value.trim() || ASA_CONFIG_POSIX_PATH,
       },
     });
     render();
@@ -622,12 +710,12 @@ function deploySelfhostedFields(wrap) {
     status('Your browser does not support direct folder access (needs Chrome or Edge). Use Create Files instead.');
     return;
   }
-  const nameInp = deployField(wrap, 'Connection name', 'e.g. My home server');
+  const nameInp = uiField(wrap, { label: 'Connection name', placeholder: 'e.g. My home server' });
   const row = document.createElement('div');
   row.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap';
   wrap.appendChild(row);
 
-  deployButton(row, uiIcon('folder', 14) + ' Choose server folder', true, async () => {
+  deployActionButton(row, uiIcon('folder', 14) + ' Choose server folder', true, async () => {
     try {
       const id = newProfileId();   // the folder handle is stored under this id
       const folder = await selfhosted.pickFolder(id);
@@ -635,10 +723,22 @@ function deploySelfhostedFields(wrap) {
       render();
       toast(`Folder "${folder}" connected.`);
     } catch (e) {
+      // the user simply closing the picker is not an error worth reporting
       if (e.name !== 'AbortError') status('Could not open the folder: ' + e.message);
     }
   });
   status('Pick your server\'s install folder (or the WindowsServer config folder directly) — remembered for next time.');
 }
 
-function deployStatusToast(msg) { toast(msg); }
+/**
+ * Drops every module-level cache this file keeps — pending logs, folder
+ * handles and the IndexedDB connection — so a different account never sees the
+ * previous one's servers. Called by auth.js when the signed-in user changes;
+ * nothing here calls it.
+ */
+function resetDeployUiState() {
+  deployLogLines.clear();
+  selfhosted.handles.clear();
+  selfhosted.closeDb();
+  deployInFlight = false;
+}

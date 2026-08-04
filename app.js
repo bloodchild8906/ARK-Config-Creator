@@ -3,7 +3,24 @@
    ========================================================================= */
 'use strict';
 
-let LS_KEY = 'asaConfigCreator.v1';   // per-account key inside the desktop app
+/* Base localStorage key. The browser build uses it as-is; the desktop app
+   swaps in a per-account key ("<base>.u<id>") the moment somebody logs in, so
+   two accounts on the same PC can never read each other's settings. */
+const LS_KEY_BASE = 'asaConfigCreator.v1';
+// auth.js reassigns this on login. ESLint analyses one file at a time and
+// cannot see the renderer's shared global scope, so it reads as never-reassigned.
+// eslint-disable-next-line prefer-const
+let LS_KEY = LS_KEY_BASE;
+
+/* File-local constants for what used to be bare literals. Anything that
+   crosses a process or file-format boundary (config file names, the default
+   port/map/slots, timeouts) comes from constants.js instead, so the renderer
+   and the main process can never drift apart. */
+const PICKER_LIST_LIMIT = 200;            // picker rows drawn before "…and N more"
+const SEARCH_MOD_NAME_PREVIEW = 6;        // catalog mod names listed in a search hit
+/* Only used for the downloadable .bat when the user has not told us where the
+   server executable lives. */
+const FALLBACK_SERVER_EXE = 'C:\\ASAServer\\' + ASA_SERVER.EXE_PARTS.join('\\');
 
 /* ---------------- state ---------------- */
 let state = { opts: {}, launch: {}, theme: 'dark' };
@@ -17,6 +34,9 @@ for (const o of OPTIONS) optByKey.set(o.k.toLowerCase(), o);
 
 const cardRefs = new Map();   // option key -> {card, update()}
 const $ = (id) => document.getElementById(id);
+
+let statePersistTimer = null;   // pending debounced localStorage write
+let badgeRefreshFrame = 0;      // pending coalesced badge recount
 
 function loadState() {
   try {
@@ -34,10 +54,31 @@ function loadState() {
   if (!state.modDocs) state.modDocs = {};
   if (!state.modContent) state.modContent = {};
 }
-function saveState() {
+/* Serialises the whole state and mirrors it into the desktop app's database.
+   Callers should use saveState() — this is the uncoalesced write behind it. */
+function writeStateNow() {
+  clearTimeout(statePersistTimer);
+  statePersistTimer = null;
   try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) { /* storage full/blocked */ }
   if (typeof authPersist === 'function') authPersist();   // mirror into the desktop app's database
 }
+/* Typing one character into a text setting fires one setVal, and every setVal
+   used to JSON.stringify the entire state (~900 options plus every selected
+   mod) straight into localStorage. Coalesce those writes into at most one per
+   debounce window; flushPendingState() guarantees nothing is ever lost. */
+function saveState() {
+  if (statePersistTimer !== null) return;
+  statePersistTimer = setTimeout(writeStateNow, APP_TIMEOUTS.STATE_PERSIST_DEBOUNCE_MS);
+}
+/** Writes a pending debounced save out immediately. A no-op when idle. */
+function flushPendingState() {
+  if (statePersistTimer !== null) writeStateNow();
+}
+/* Closing the window (or the desktop app's own beforeunload mirror in auth.js)
+   must never drop the last keystroke. Registered at load time so it is in
+   place before any handler that reads localStorage back. */
+window.addEventListener('beforeunload', flushPendingState);
+
 /* Wipe in-memory state back to defaults (keeps the UI theme). Used when a
    different user logs in so the previous account's data can never leak in. */
 function resetState() {
@@ -62,14 +103,31 @@ function isChanged(o) {
   }
   return String(v ?? '') !== String(o.d ?? '');
 }
+/**
+ * True when `value` is indistinguishable from the field's documented default.
+ *
+ * Shared by every setter (`setVal`, `setValSilent`, `setLaunch`) for both
+ * OPTIONS entries and LAUNCH_FIELDS entries, which share the `{ t, d }` shape.
+ * Storing a value equal to the default is what makes a setting count as
+ * "changed" forever and get written into the .ini, so all three delete the key
+ * instead. This test used to be written out three times, twice byte-identical.
+ *
+ * @param {{t: string, d: *}} field an OPTIONS or LAUNCH_FIELDS entry
+ * @param {*} value the candidate value
+ */
+function isDefaultValue(field, value) {
+  if (field.t === 'bool') return Boolean(value) === Boolean(field.d);
+  if (field.t === 'float' || field.t === 'int') {
+    const n = normNum(value);
+    // non-numeric text in a numeric field can still literally match the default
+    return n === null ? String(value ?? '') === String(field.d ?? '') : n === normNum(field.d);
+  }
+  return String(value ?? '') === String(field.d ?? '');
+}
 function setVal(o, v) {
-  const same = (o.t === 'bool') ? Boolean(v) === Boolean(o.d)
-    : (o.t === 'float' || o.t === 'int') ? normNum(v) !== null && normNum(v) === normNum(o.d)
-    : String(v ?? '') === String(o.d ?? '');
-  if (same) delete state.opts[o.k];
-  else state.opts[o.k] = v;
+  setValSilent(o, v);
   saveState();
-  refreshBadges();
+  scheduleBadgeRefresh();
 }
 function resetVal(o) {
   delete state.opts[o.k];
@@ -215,50 +273,46 @@ function renderPickerList() {
     ? src.filter((e) => e.n.toLowerCase().includes(term) || e.c.toLowerCase().includes(term))
     : src;
   const total = list.length;
-  list = list.slice(0, 200);
+  list = list.slice(0, PICKER_LIST_LIMIT);
   for (const e of list) {
-    const row = document.createElement('div');
-    row.className = 'picker-row';
     const badge = e.mod ? 'From mod: ' + e.mod : comboGroupOf(pickerCtx.pick.t, e);
-    row.innerHTML = `<div class="picker-row-main"><b>${esc(e.n)}</b>${badge ? ` <span class="mod-badge">${esc(badge)}</span>` : ''}<br><code>${esc(e.c)}</code></div>`;
-    const btns = document.createElement('div');
-    btns.className = 'picker-row-btns';
-    const bCopy = document.createElement('button');
-    bCopy.className = 'btn small';
-    bCopy.innerHTML = uiIcon('copy', 15);
-    bCopy.title = 'Copy class name';
-    bCopy.addEventListener('click', () => copyText(e.c).then(() => toast(`Copied ${e.c}`)));
-    btns.appendChild(bCopy);
+    const row = uiElement('div', {
+      className: 'picker-row',
+      html: `<div class="picker-row-main"><b>${esc(e.n)}</b>${badge ? ` <span class="mod-badge">${esc(badge)}</span>` : ''}<br><code>${esc(e.c)}</code></div>`,
+      parent: wrap,
+    });
+    const btns = uiElement('div', { className: 'picker-row-btns', parent: row });
+    uiButton(btns, {
+      small: true,
+      html: uiIcon('copy', 15),
+      title: 'Copy class name',
+      onClick: () => copyText(e.c).then(() => toast(`Copied ${e.c}`)),
+    });
     if (!pickerCtx.pick.copy) {
-      const bAdd = document.createElement('button');
-      bAdd.className = 'btn small primary';
-      bAdd.innerHTML = uiIcon('plus', 15);
-      bAdd.title = 'Add an entry for this ' + (pickerCtx.pick.t === 'dino' ? 'creature' : 'engram');
-      bAdd.addEventListener('click', () => {
-        const line = (pickerCtx.pick.tpl || '{c}').replace('{c}', e.c).replace('{t}', e.t || e.n.replace(/[^A-Za-z0-9]/g, ''));
-        const ta = pickerCtx.textarea;
-        ta.value = (ta.value.trim() ? ta.value.replace(/\s+$/, '') + '\n' : '') + line;
-        ta.dispatchEvent(new Event('input', { bubbles: true }));
-        toast(`${e.n} added to “${pickerCtx.optName}”`);
+      uiButton(btns, {
+        small: true,
+        variant: 'primary',
+        html: uiIcon('plus', 15),
+        title: 'Add an entry for this ' + (pickerCtx.pick.t === 'dino' ? 'creature' : 'engram'),
+        onClick: () => {
+          const line = (pickerCtx.pick.tpl || '{c}').replace('{c}', e.c).replace('{t}', e.t || e.n.replace(/[^A-Za-z0-9]/g, ''));
+          const ta = pickerCtx.textarea;
+          ta.value = (ta.value.trim() ? ta.value.replace(/\s+$/, '') + '\n' : '') + line;
+          ta.dispatchEvent(new Event('input', { bubbles: true }));
+          toast(`${e.n} added to “${pickerCtx.optName}”`);
+        },
       });
-      btns.appendChild(bAdd);
     }
-    row.appendChild(btns);
-    wrap.appendChild(row);
   }
   if (total > list.length) {
-    const more = document.createElement('div');
-    more.className = 'empty-msg';
+    const more = uiElement('div', {
+      className: 'empty-msg',
+      text: `…and ${total - list.length} more — type to narrow the list.`,
+      parent: wrap,
+    });
     more.style.padding = '10px 0';
-    more.textContent = `…and ${total - list.length} more — type to narrow the list.`;
-    wrap.appendChild(more);
   }
-  if (!total) {
-    const none = document.createElement('div');
-    none.className = 'empty-msg';
-    none.textContent = 'Nothing matches your search.';
-    wrap.appendChild(none);
-  }
+  if (!total) uiElement('div', { className: 'empty-msg', text: 'Nothing matches your search.', parent: wrap });
 }
 
 /* ---------------- toast ---------------- */
@@ -268,7 +322,7 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
+  toastTimer = setTimeout(() => t.classList.remove('show'), APP_TIMEOUTS.TOAST_MS);
 }
 
 /* ---------------- sidebar ---------------- */
@@ -294,7 +348,10 @@ function buildSidebar() {
     if (c.id === 'mods') {
       for (const entry of (state.mods || [])) {
         const mod = modInfo(entry);
-        const icon = (MOD_CATS[mod.cat] || MOD_CATS.other).icon;
+        // MOD_CATS[*].icon holds an emoji, which uiIcon() cannot resolve — it
+        // would silently fall back to the generic "info" glyph for every mod.
+        // mods.js owns the category → ICON_PATHS mapping; use it.
+        const icon = modCatIconName(mod.cat);
         const label = mod.name.length > 24 ? mod.name.slice(0, 23) + '…' : mod.name;
         addItem('mod:' + mod.id, icon, label, 'subitem');
       }
@@ -328,31 +385,55 @@ function refreshBadges() {
   const el = $('changedTotal');
   if (el) el.textContent = total === 0 ? 'Everything is at default values.' : `${total} setting${total === 1 ? '' : 's'} changed from default.`;
 }
+/* refreshBadges() re-counts every category for each of the 20+ nav items, and
+   each count scans all ~900 options plus every selected mod's keys. Running
+   that per keystroke was tens of thousands of comparisons per character, so
+   the edit path coalesces it down to one recount per animation frame. */
+function scheduleBadgeRefresh() {
+  if (badgeRefreshFrame) return;
+  badgeRefreshFrame = requestAnimationFrame(() => {
+    badgeRefreshFrame = 0;
+    refreshBadges();
+  });
+}
 
 /* ---------------- option cards ---------------- */
-function makeBoolControl(o, onchange) {
-  const wrap = document.createElement('div');
-  wrap.style.display = 'flex';
-  wrap.style.alignItems = 'center';
-  wrap.style.gap = '8px';
-  const lab = document.createElement('label');
-  lab.className = 'switch';
-  const inp = document.createElement('input');
-  inp.type = 'checkbox';
-  const sl = document.createElement('span');
-  sl.className = 'slider-sw';
-  lab.appendChild(inp); lab.appendChild(sl);
-  const stateTxt = document.createElement('span');
-  stateTxt.className = 'sw-state';
-  wrap.appendChild(lab); wrap.appendChild(stateTxt);
-  inp.addEventListener('change', () => { onchange(inp.checked); sync(); });
+
+/**
+ * The ON/OFF slider widget, in one place. Option cards and launch-option cards
+ * used to contain two hand-written copies of the same markup and wiring.
+ *
+ * @param {{
+ *   read: () => *,                       current value (coerced to a boolean)
+ *   onChange: (checked: boolean) => void, called before the widget re-syncs
+ *   onSync?: () => void                   called after every repaint
+ * }} options
+ * @returns {{ el: HTMLElement, sync: () => void }}
+ */
+function makeSwitchControl(options) {
+  const wrap = uiElement('div');
+  wrap.style.cssText = 'display:flex;align-items:center;gap:8px';
+
+  const label = uiElement('label', { className: 'switch', parent: wrap });
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  label.appendChild(input);
+  uiElement('span', { className: 'slider-sw', parent: label });
+  const stateText = uiElement('span', { className: 'sw-state', parent: wrap });
+
   function sync() {
-    inp.checked = Boolean(getVal(o));
-    stateTxt.textContent = inp.checked ? 'ON' : 'OFF';
-    stateTxt.classList.toggle('on', inp.checked);
+    input.checked = Boolean(options.read());
+    stateText.textContent = input.checked ? 'ON' : 'OFF';
+    stateText.classList.toggle('on', input.checked);
+    if (options.onSync) options.onSync();
   }
+  input.addEventListener('change', () => { options.onChange(input.checked); sync(); });
   sync();
   return { el: wrap, sync };
+}
+
+function makeBoolControl(o, onchange) {
+  return makeSwitchControl({ read: () => getVal(o), onChange: onchange });
 }
 
 function makeNumControl(o, onchange) {
@@ -417,30 +498,44 @@ function makeTextControl(o, onchange, multiline) {
   return { el: wrap, sync };
 }
 
+/** "Default: 1.5" / "Default: ON" — empty for virtual (file-level) options. */
+function defaultValueText(o) {
+  if (o.dNull) return 'Default: (not documented — only written if you set it)';
+  if (o.virtual) return '';
+  return 'Default: ' + (o.t === 'bool' ? (o.d ? 'ON' : 'OFF') : (o.d === '' ? '(empty)' : o.d));
+}
+
+/**
+ * The footer every option card shares: default-value text on the left, the
+ * reset link on the right. `.reset-btn` is deliberately not a ui-kit `.btn` —
+ * it is styled as a quiet inline link inside the card.
+ */
+function appendCardFoot(card, defaultText, resetLabel, onReset) {
+  const foot = uiElement('div', { className: 'opt-foot', parent: card });
+  uiElement('span', { text: defaultText, parent: foot });
+  uiElement('span', { className: 'spacer', parent: foot });
+  const reset = uiElement('button', { className: 'reset-btn', text: resetLabel, parent: foot });
+  reset.addEventListener('click', onReset);
+}
+
 function makeCard(o) {
   const card = document.createElement('div');
   card.className = 'opt-card';
   const isWide = o.t === 'text' || o.t === 'raw';
   if (isWide) card.classList.add('wide');
 
-  const head = document.createElement('div');
-  head.className = 'opt-head';
-  const left = document.createElement('div');
-  const fileLabel = o.virtual ? (o.f === 'gus' ? 'GameUserSettings.ini' : 'Game.ini')
-    : `${o.f === 'gus' ? 'GameUserSettings.ini' : 'Game.ini'} › [${optSection(o)}]`;
-  left.innerHTML = `<div class="opt-name">${esc(o.n)}</div><code class="opt-key" title="${esc(fileLabel)}">${o.virtual ? esc(fileLabel) : esc(o.dk || o.k)}</code>`;
-  head.appendChild(left);
-  card.appendChild(head);
+  const iniName = o.f === 'gus' ? ASA_SERVER.FILES.GAME_USER_SETTINGS : ASA_SERVER.FILES.GAME;
+  const fileLabel = o.virtual ? iniName : `${iniName} › [${optSection(o)}]`;
+  const head = uiElement('div', {
+    className: 'opt-head',
+    html: `<div><div class="opt-name">${esc(o.n)}</div>`
+      + `<code class="opt-key" title="${esc(fileLabel)}">${o.virtual ? esc(fileLabel) : esc(o.dk || o.k)}</code></div>`,
+    parent: card,
+  });
 
-  const help = document.createElement('p');
-  help.className = 'opt-help';
-  help.textContent = o.h;
-  card.appendChild(help);
+  const help = uiElement('p', { className: 'opt-help', text: o.h, parent: card });
   if (o.note) {
-    const note = document.createElement('p');
-    note.className = 'opt-note';
-    note.innerHTML = uiIcon('warn', 13) + ' ' + esc(o.note);
-    card.appendChild(note);
+    uiElement('p', { className: 'opt-note', html: uiIcon('warn', 13) + ' ' + esc(o.note), parent: card });
   }
 
   const onchange = (v) => {
@@ -456,43 +551,29 @@ function makeCard(o) {
 
   // visual builder + class-name picker for list-style settings
   if (o.t === 'text' || o.t === 'raw') {
-    const btnRow = document.createElement('div');
+    const btnRow = uiElement('div');
     btnRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:2px';
     const ta = ctl.el.querySelector('textarea');
     if (typeof BUILDERS !== 'undefined' && BUILDERS[o.k] && !o.modId) {
-      const bb = document.createElement('button');
-      bb.className = 'btn small primary';
-      bb.innerHTML = uiIcon('wand', 15) + ' Edit visually…';
-      bb.addEventListener('click', () => openBuilder(o.k, ta, o.n));
-      btnRow.appendChild(bb);
+      uiButton(btnRow, {
+        small: true,
+        variant: 'primary',
+        html: uiIcon('wand', 15) + ' Edit visually…',
+        onClick: () => openBuilder(o.k, ta, o.n),
+      });
     }
     const pick = pickForOption(o);
     if (pick) {
-      const pb = document.createElement('button');
-      pb.className = 'btn small';
-      pb.innerHTML = (pick.t === 'dino' ? uiIcon('dino', 15) + ' Pick a creature…' : uiIcon('book', 15) + ' Pick an engram…');
-      pb.addEventListener('click', () => openPicker(pick, ta, o.n));
-      btnRow.appendChild(pb);
+      uiButton(btnRow, {
+        small: true,
+        html: pick.t === 'dino' ? uiIcon('dino', 15) + ' Pick a creature…' : uiIcon('book', 15) + ' Pick an engram…',
+        onClick: () => openPicker(pick, ta, o.n),
+      });
     }
     if (btnRow.children.length) card.insertBefore(btnRow, ctl.el.nextSibling);
   }
 
-  const foot = document.createElement('div');
-  foot.className = 'opt-foot';
-  const defTxt = document.createElement('span');
-  if (o.dNull) {
-    defTxt.textContent = 'Default: (not documented — only written if you set it)';
-  } else if (!o.virtual) {
-    defTxt.textContent = 'Default: ' + (o.t === 'bool' ? (o.d ? 'ON' : 'OFF') : (o.d === '' ? '(empty)' : o.d));
-  }
-  const spacer = document.createElement('span');
-  spacer.className = 'spacer';
-  const rb = document.createElement('button');
-  rb.className = 'reset-btn';
-  rb.textContent = 'Reset to default';
-  rb.addEventListener('click', () => resetVal(o));
-  foot.appendChild(defTxt); foot.appendChild(spacer); foot.appendChild(rb);
-  card.appendChild(foot);
+  appendCardFoot(card, defaultValueText(o), 'Reset to default', () => resetVal(o));
 
   const update = () => {
     ctl.sync();
@@ -510,15 +591,13 @@ function makeStatGroupCard(grpId) {
   const card = document.createElement('div');
   card.className = 'opt-card wide';
 
-  const head = document.createElement('div');
-  head.className = 'opt-head';
-  head.innerHTML = `<div><div class="opt-name">${esc(meta.n)}</div><code class="opt-key">Game.ini › ${esc(grpId)}[0…11]</code></div>`;
-  card.appendChild(head);
-
-  const help = document.createElement('p');
-  help.className = 'opt-help';
-  help.textContent = meta.h + ' Default for every stat is 1.';
-  card.appendChild(help);
+  uiElement('div', {
+    className: 'opt-head',
+    html: `<div><div class="opt-name">${esc(meta.n)}</div>`
+      + `<code class="opt-key">${esc(ASA_SERVER.FILES.GAME)} › ${esc(grpId)}[0…11]</code></div>`,
+    parent: card,
+  });
+  uiElement('p', { className: 'opt-help', text: meta.h + ' Default for every stat is 1.', parent: card });
 
   const wrapGrid = document.createElement('div');
   wrapGrid.className = 'stat-cols';
@@ -564,20 +643,10 @@ function makeStatGroupCard(grpId) {
     fxDiv.style.display = txt ? '' : 'none';
   }
 
-  const foot = document.createElement('div');
-  foot.className = 'opt-foot';
-  const spacer = document.createElement('span');
-  spacer.className = 'spacer';
-  const rb = document.createElement('button');
-  rb.className = 'reset-btn';
-  rb.textContent = 'Reset all 12 to default';
-  rb.addEventListener('click', () => {
+  appendCardFoot(card, '', 'Reset all 12 to default', () => {
     members.forEach((o) => delete state.opts[o.k]);
     saveState(); update(); refreshBadges();
   });
-  foot.appendChild(document.createElement('span'));
-  foot.appendChild(spacer); foot.appendChild(rb);
-  card.appendChild(foot);
 
   function update() {
     for (const { o, inp } of inputs) {
@@ -597,40 +666,54 @@ function getLaunch(f) {
   return Object.prototype.hasOwnProperty.call(state.launch, f.k) ? state.launch[f.k] : f.d;
 }
 function setLaunch(f, v) {
-  const same = String(v) === String(f.d) || (f.t === 'bool' && Boolean(v) === Boolean(f.d));
-  if (same) delete state.launch[f.k];
+  if (isDefaultValue(f, v)) delete state.launch[f.k];
   else state.launch[f.k] = v;
   saveState();
-  refreshBadges();
+  scheduleBadgeRefresh();
   updateCmdBox();
 }
 let cmdBoxEl = null;
 function buildLaunchCommand(forBat) {
   const spec = buildLaunchSpec();
   const exe = forBat
-    ? `"${spec.serverPath || 'C:\\ASAServer\\ShooterGame\\Binaries\\Win64\\ArkAscendedServer.exe'}"`
-    : 'ArkAscendedServer.exe';
+    ? `"${spec.serverPath || FALLBACK_SERVER_EXE}"`
+    : ASA_SERVER.EXE_PARTS[ASA_SERVER.EXE_PARTS.length - 1];
   const args = spec.args.map((arg) => arg.startsWith('-ClusterDirOverride=')
     ? '-ClusterDirOverride="' + arg.slice('-ClusterDirOverride='.length) + '"'
     : arg);
   if (spec.extraArgs) args.push(spec.extraArgs);
   return `${exe} "${spec.query}" ${args.join(' ')}`;
 }
+/**
+ * Makes a user-supplied value safe to interpolate into the `?a=b?c=d` launch
+ * query string.
+ *
+ * The query is one shell-quoted argument handed straight to spawn(), and `?`
+ * separates parameters inside it. Without this, a server name of
+ * `My Server?ServerAdminPassword=hunter2` silently became a real launch
+ * parameter — anybody who could set the name could set any option. `&` is
+ * stripped for the same reason (some hosts' wrappers split on it) and `"`
+ * because it would terminate the quoted argument in the generated .bat.
+ */
+function sanitizeQueryValue(value) {
+  return String(value ?? '').replace(/[?&"]/g, '');
+}
+
 function buildLaunchSpec() {
   const L = {};
   for (const f of LAUNCH_FIELDS) L[f.k] = getLaunch(f);
-  const map = L.map === '__custom' ? (L.customMap || 'TheIsland_WP') : L.map;
+  const map = L.map === '__custom' ? (L.customMap || ASA_SERVER.DEFAULT_MAP) : L.map;
 
   // the whole query string is wrapped in one pair of quotes, so spaces in the
   // session name are fine — no inner quotes (they would break the command line)
-  let query = map + '?listen';
+  let query = sanitizeQueryValue(map) + '?listen';
   const sn = state.opts.SessionName;
-  if (sn) query += `?SessionName=${sn}`;
+  if (sn) query += `?SessionName=${sanitizeQueryValue(sn)}`;
   const port = state.opts.Port;
-  if (port) query += `?Port=${port}`;
+  if (port) query += `?Port=${sanitizeQueryValue(port)}`;
 
   const args = [];
-  args.push(`-WinLiveMaxPlayers=${L.maxPlayers || 70}`);
+  args.push(`-WinLiveMaxPlayers=${L.maxPlayers || ASA_SERVER.DEFAULT_MAX_PLAYERS}`);
   // mods: selected in the Mods tab (in load order) + any extra manual IDs
   const modIds = selectedModIds();
   if (L.mods) {
@@ -716,135 +799,260 @@ function updateCmdBox() {
   if (cmdBoxEl) cmdBoxEl.textContent = buildLaunchCommand(false);
 }
 
-function renderLaunchCategory(grid) {
-  const fieldCards = {};   // field key -> card, so handlers can toggle related cards
-  for (const f of LAUNCH_FIELDS) {
-    const card = document.createElement('div');
-    fieldCards[f.k] = card;
-    card.className = 'opt-card';
-    const head = document.createElement('div');
-    head.className = 'opt-head';
-    const left = document.createElement('div');
-    left.innerHTML = `<div class="opt-name">${esc(f.n)}</div><code class="opt-key">launch option</code>`;
-    head.appendChild(left);
-    card.appendChild(head);
-    const help = document.createElement('p');
-    help.className = 'opt-help';
-    help.textContent = f.h;
-    card.appendChild(help);
+/** True when a launch field currently differs from its default. */
+function isLaunchChanged(f) {
+  return !isDefaultValue(f, getLaunch(f));
+}
 
-    if (f.t === 'bool') {
-      const wrap = document.createElement('div');
-      wrap.style.cssText = 'display:flex;align-items:center;gap:8px';
-      const lab = document.createElement('label');
-      lab.className = 'switch';
-      const inp = document.createElement('input');
-      inp.type = 'checkbox';
-      const sl = document.createElement('span');
-      sl.className = 'slider-sw';
-      lab.appendChild(inp); lab.appendChild(sl);
-      const stateTxt = document.createElement('span');
-      stateTxt.className = 'sw-state';
-      wrap.appendChild(lab); wrap.appendChild(stateTxt);
-      const syncL = () => {
-        inp.checked = Boolean(getLaunch(f));
-        stateTxt.textContent = inp.checked ? 'ON' : 'OFF';
-        stateTxt.classList.toggle('on', inp.checked);
-        card.classList.toggle('changed', Boolean(getLaunch(f)) !== Boolean(f.d));
-      };
-      inp.addEventListener('change', () => { setLaunch(f, inp.checked); syncL(); });
-      syncL();
-      head.appendChild(wrap);
-    } else if (f.t === 'int') {
-      const wrap = document.createElement('div');
-      wrap.className = 'ctl-num';
-      const num = document.createElement('input');
-      num.type = 'number';
-      num.step = '1';
-      num.value = getLaunch(f);
-      num.addEventListener('input', () => {
-        if (num.value === '') return;
-        setLaunch(f, num.value);
-        card.classList.toggle('changed', String(getLaunch(f)) !== String(f.d));
-      });
-      wrap.appendChild(num);
-      card.appendChild(wrap);
-    } else if (f.t === 'select' || f.t === 'map') {
-      const sel = document.createElement('select');
-      const choices = f.t === 'map' ? MAPS.map((m) => [m.id, m.name]) : f.choices;
-      for (const [v, label] of choices) {
-        const op = document.createElement('option');
-        op.value = v; op.textContent = label;
-        sel.appendChild(op);
-      }
-      sel.value = getLaunch(f);
-      sel.addEventListener('change', () => {
-        setLaunch(f, sel.value);
-        card.classList.toggle('changed', String(getLaunch(f)) !== String(f.d));
-        // show/hide the custom-map card in place — a full render() here would
-        // destroy this select and drop keyboard focus on every arrow-key step
-        if (f.t === 'map' && fieldCards.customMap) {
-          fieldCards.customMap.style.display = sel.value === '__custom' ? '' : 'none';
-        }
-      });
-      card.appendChild(sel);
-    } else {
-      const wrap = document.createElement('div');
-      wrap.className = 'ctl-text';
-      const inp = document.createElement('input');
-      inp.type = 'text';
-      if (f.ph) inp.placeholder = f.ph;
-      inp.value = getLaunch(f);
-      inp.addEventListener('input', () => {
-        setLaunch(f, inp.value);
-        card.classList.toggle('changed', String(getLaunch(f)) !== String(f.d));
-      });
-      wrap.appendChild(inp);
-      card.appendChild(wrap);
-    }
-    card.classList.toggle('changed', f.t === 'bool'
-      ? Boolean(getLaunch(f)) !== Boolean(f.d)
-      : String(getLaunch(f)) !== String(f.d));
+/** Toggles the card's "changed" ring from the field's current value. */
+function markLaunchCard(card, f) {
+  card.classList.toggle('changed', isLaunchChanged(f));
+}
 
-    if (f.k === 'customMap' && getLaunch(LAUNCH_FIELDS[0]) !== '__custom') card.style.display = 'none';
-    grid.appendChild(card);
+/**
+ * Builds the input for one launch field and attaches it to its card.
+ * `fieldCards` is the key → card map so the map select can show/hide the
+ * custom-map card without a re-render.
+ */
+function buildLaunchControl(f, card, head, fieldCards) {
+  if (f.t === 'bool') {
+    const control = makeSwitchControl({
+      read: () => getLaunch(f),
+      onChange: (checked) => setLaunch(f, checked),
+      onSync: () => markLaunchCard(card, f),
+    });
+    head.appendChild(control.el);
+    return;
   }
 
-  // live command preview
-  const box = document.createElement('div');
-  box.className = 'cmd-box';
-  cmdBoxEl = box;
-  const label = document.createElement('div');
-  label.className = 'search-cat-label';
-  label.innerHTML = uiIcon('server', 14) + ' Your start command (auto-generated)';
-  grid.appendChild(label);
-  grid.appendChild(box);
-  const rowBtns = document.createElement('div');
-  rowBtns.style.gridColumn = '1 / -1';
-  rowBtns.style.display = 'flex';
-  rowBtns.style.gap = '8px';
-  const bCopy = document.createElement('button');
-  bCopy.className = 'btn small';
-  bCopy.innerHTML = uiIcon('copy', 15) + ' Copy command';
-  bCopy.addEventListener('click', () => copyText(buildLaunchCommand(false)).then(() => toast('Command copied!')));
-  const bBat = document.createElement('button');
-  bBat.className = 'btn small primary';
-  bBat.innerHTML = uiIcon('download', 15) + ' Download StartServer.bat';
-  bBat.addEventListener('click', () => { download('StartServer.bat', buildBat()); toast('StartServer.bat downloaded'); });
-  rowBtns.appendChild(bCopy); rowBtns.appendChild(bBat);
-  grid.appendChild(rowBtns);
+  if (f.t === 'int') {
+    const wrap = uiElement('div', { className: 'ctl-num', parent: card });
+    const num = uiElement('input', { parent: wrap });
+    num.type = 'number';
+    num.step = '1';
+    num.value = getLaunch(f);
+    num.addEventListener('input', () => {
+      if (num.value === '') return;
+      setLaunch(f, num.value);
+      markLaunchCard(card, f);
+    });
+    return;
+  }
+
+  if (f.t === 'select' || f.t === 'map') {
+    const sel = uiElement('select', { parent: card });
+    const choices = f.t === 'map' ? MAPS.map((m) => [m.id, m.name]) : f.choices;
+    for (const [v, label] of choices) {
+      const op = uiElement('option', { text: label, parent: sel });
+      op.value = v;
+    }
+    sel.value = getLaunch(f);
+    sel.addEventListener('change', () => {
+      setLaunch(f, sel.value);
+      markLaunchCard(card, f);
+      // show/hide the custom-map card in place — a full render() here would
+      // destroy this select and drop keyboard focus on every arrow-key step
+      if (f.t === 'map' && fieldCards.customMap) {
+        fieldCards.customMap.style.display = sel.value === '__custom' ? '' : 'none';
+      }
+    });
+    return;
+  }
+
+  const wrap = uiElement('div', { className: 'ctl-text', parent: card });
+  const inp = uiElement('input', { parent: wrap });
+  inp.type = 'text';
+  if (f.ph) inp.placeholder = f.ph;
+  inp.value = getLaunch(f);
+  inp.addEventListener('input', () => {
+    setLaunch(f, inp.value);
+    markLaunchCard(card, f);
+  });
+}
+
+/** One launch-option card: title, help text and the field's own control. */
+function makeLaunchCard(f, fieldCards) {
+  const card = uiElement('div', { className: 'opt-card' });
+  const head = uiElement('div', {
+    className: 'opt-head',
+    html: `<div><div class="opt-name">${esc(f.n)}</div><code class="opt-key">launch option</code></div>`,
+    parent: card,
+  });
+  uiElement('p', { className: 'opt-help', text: f.h, parent: card });
+
+  buildLaunchControl(f, card, head, fieldCards);
+  markLaunchCard(card, f);
+
+  // the custom map name only matters while the map select is on "Custom"
+  if (f.k === 'customMap' && getLaunch(LAUNCH_FIELDS[0]) !== '__custom') card.style.display = 'none';
+  return card;
+}
+
+/** The live "your start command" preview plus its copy / download buttons. */
+function appendCommandPreview(grid) {
+  uiElement('div', {
+    className: 'search-cat-label',
+    html: uiIcon('server', 14) + ' Your start command (auto-generated)',
+    parent: grid,
+  });
+  cmdBoxEl = uiElement('div', { className: 'cmd-box', parent: grid });
+
+  const rowBtns = uiElement('div', { parent: grid });
+  rowBtns.style.cssText = 'grid-column:1 / -1;display:flex;gap:8px';
+  uiButton(rowBtns, {
+    small: true,
+    html: uiIcon('copy', 15) + ' Copy command',
+    onClick: () => copyText(buildLaunchCommand(false)).then(() => toast('Command copied!')),
+  });
+  uiButton(rowBtns, {
+    small: true,
+    variant: 'primary',
+    html: uiIcon('download', 15) + ' Download ' + esc(ASA_SERVER.FILES.START_SCRIPT),
+    onClick: () => {
+      download(ASA_SERVER.FILES.START_SCRIPT, buildBat());
+      toast(ASA_SERVER.FILES.START_SCRIPT + ' downloaded');
+    },
+  });
   updateCmdBox();
 }
 
-/* ---------------- render ---------------- */
-function esc(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function renderLaunchCategory(grid) {
+  const fieldCards = {};   // field key -> card, so handlers can toggle related cards
+  for (const f of LAUNCH_FIELDS) {
+    fieldCards[f.k] = makeLaunchCard(f, fieldCards);
+    grid.appendChild(fieldCards[f.k]);
+  }
+  appendCommandPreview(grid);
 }
+
+/* ---------------- render ----------------
+   `esc()` used to live here. It now comes from ui-kit.js, which also escapes
+   the single quote — every call site is unchanged. */
 
 function matchesSearch(o, term) {
   return o.n.toLowerCase().includes(term) || o.k.toLowerCase().includes(term) || (o.h || '').toLowerCase().includes(term);
 }
 
+/** Categories that have their own page instead of a grid of option cards. */
+const SPECIAL_CATEGORY_RENDERERS = {
+  launch: (grid) => renderLaunchCategory(grid),
+  setup: (grid) => renderLocalServerSetup(grid),
+  mods: (grid) => renderModsCategory(grid),
+  deploy: (grid) => renderDeployCategory(grid),
+};
+
+/** A "── icon Name ──" divider above a group of search hits. */
+function appendSectionLabel(grid, html) {
+  uiElement('div', { className: 'search-cat-label', html, parent: grid });
+}
+
+/** The cards for one normal category, with each stat group collapsed to one. */
+function cardsForOptions(options) {
+  const groupsDone = new Set();
+  const cards = [];
+  for (const o of options) {
+    if (o.grp) {
+      if (groupsDone.has(o.grp)) continue;
+      groupsDone.add(o.grp);
+      cards.push(makeStatGroupCard(o.grp));
+    } else {
+      cards.push(makeCard(o));
+    }
+  }
+  return cards;
+}
+
+/** Search hits from the built-in option catalog, grouped by category. */
+function appendOptionSearchHits(grid, term) {
+  let any = false;
+  for (const c of CATEGORIES) {
+    // these three are whole pages, not searchable option cards
+    if (c.id === 'launch' || c.id === 'setup' || c.id === 'custom') continue;
+    const matches = OPTIONS.filter((o) => o.c === c.id && matchesSearch(o, term) && (!changedOnly || isChanged(o)));
+    const cards = cardsForOptions(matches);
+    if (!cards.length) continue;
+    any = true;
+    appendSectionLabel(grid, `${uiIcon(c.icon, 14)} ${esc(c.name)}`);
+    cards.forEach((el) => grid.appendChild(el));
+  }
+  return any;
+}
+
+/** Search hits among the settings of the mods the user already selected. */
+function appendSelectedModSearchHits(grid, term) {
+  let any = false;
+  for (const entry of (state.mods || [])) {
+    const mod = modInfo(entry);
+    const cards = [];
+    for (const sec of (mod.ini || [])) {
+      for (const s of sec.settings) {
+        const o = modOption(mod, sec, s);
+        if (matchesSearch(o, term) && (!changedOnly || isChanged(o))) cards.push(makeCard(o));
+      }
+    }
+    if (!cards.length) continue;
+    any = true;
+    appendSectionLabel(grid, uiIcon('puzzle', 14) + ' ' + esc(mod.name));
+    cards.forEach((el) => grid.appendChild(el));
+  }
+  return any;
+}
+
+/** A single card pointing at the mod browser when the catalog matches. */
+function appendCatalogModSearchHits(grid, term) {
+  const modMatches = MODS_DB.filter((m) => m.name.toLowerCase().includes(term) || (m.sum || '').toLowerCase().includes(term));
+  if (!modMatches.length) return false;
+
+  appendSectionLabel(grid, uiIcon('puzzle', 14) + ' Mods');
+  const names = modMatches.slice(0, SEARCH_MOD_NAME_PREVIEW).map((m) => esc(m.name)).join(', ');
+  const card = uiElement('div', {
+    className: 'opt-card wide',
+    html: `<p class="opt-help">${modMatches.length} mod${modMatches.length === 1 ? '' : 's'} match in the CurseForge catalog: `
+      + `<b>${names}${modMatches.length > SEARCH_MOD_NAME_PREVIEW ? '…' : ''}</b></p>`,
+    parent: grid,
+  });
+  uiButton(card, {
+    small: true,
+    variant: 'primary',
+    html: uiIcon('puzzle', 16) + ' Open Mod Browser',
+    onClick: () => { openModBrowser(); $('modSearch').value = term; browserFilter.term = term; renderModBrowser(); },
+  });
+  return true;
+}
+
+/* Search mode: one flat page of hits from every category, the user's mods and
+   the bundled mod catalog. */
+function renderSearchResults(grid, headEl, term) {
+  headEl.innerHTML = `<h2><span class="h2ic">${uiIcon('search', 22)}</span> Search results for “${esc(term)}”</h2>`
+    + '<p>Searching every category. Clear the search box to go back.</p>';
+
+  // deliberately not short-circuiting: every section appends its own hits
+  const found = [
+    appendOptionSearchHits(grid, term),
+    appendSelectedModSearchHits(grid, term),
+    appendCatalogModSearchHits(grid, term),
+  ].some(Boolean);
+
+  if (!found) uiElement('div', { className: 'empty-msg', text: 'No settings match your search.', parent: grid });
+}
+
+/* A plain category: every option card that belongs to it. */
+function renderOptionCategory(grid) {
+  const visible = OPTIONS.filter((o) => o.c === currentCat
+    && !(changedOnly && !(o.grp ? OPTIONS.some((m) => m.grp === o.grp && isChanged(m)) : isChanged(o))));
+  const cards = cardsForOptions(visible);
+  cards.forEach((card) => grid.appendChild(card));
+  if (!cards.length) {
+    uiElement('div', {
+      className: 'empty-msg',
+      text: changedOnly ? 'You haven’t changed anything in this category yet.' : 'Nothing here.',
+      parent: grid,
+    });
+  }
+}
+
+/* Routing only: pick the page for the current category (or the search term)
+   and hand the grid to whoever renders it. */
 function render() {
   if (typeof syncLocalServerConsoleConsumer === 'function' && (currentCat !== 'setup' || searchTerm)) {
     syncLocalServerConsoleConsumer(false);
@@ -857,73 +1065,9 @@ function render() {
 
   const headEl = $('catHeader');
   if (searchTerm) {
-    headEl.innerHTML = `<h2><span class="h2ic">${uiIcon('search', 22)}</span> Search results for “${esc(searchTerm)}”</h2><p>Searching every category. Clear the search box to go back.</p>`;
-    let any = false;
-    for (const c of CATEGORIES) {
-    if (c.id === 'launch' || c.id === 'setup' || c.id === 'custom') continue;
-      const matches = OPTIONS.filter((o) => o.c === c.id && matchesSearch(o, searchTerm) && (!changedOnly || isChanged(o)));
-      const grpsDone = new Set();
-      const cards = [];
-      for (const o of matches) {
-        if (o.grp) {
-          if (!grpsDone.has(o.grp)) { grpsDone.add(o.grp); cards.push(makeStatGroupCard(o.grp)); }
-        } else cards.push(makeCard(o));
-      }
-      if (cards.length) {
-        any = true;
-        const lab = document.createElement('div');
-        lab.className = 'search-cat-label';
-        lab.innerHTML = `${uiIcon(c.icon, 14)} ${esc(c.name)}`;
-        grid.appendChild(lab);
-        cards.forEach((el) => grid.appendChild(el));
-      }
-    }
-    // settings of your selected mods
-    for (const entry of (state.mods || [])) {
-      const mod = modInfo(entry);
-      const cards = [];
-      for (const sec of (mod.ini || [])) {
-        for (const s of sec.settings) {
-          const o = modOption(mod, sec, s);
-          if (matchesSearch(o, searchTerm) && (!changedOnly || isChanged(o))) cards.push(makeCard(o));
-        }
-      }
-      if (cards.length) {
-        any = true;
-        const lab = document.createElement('div');
-        lab.className = 'search-cat-label';
-        lab.innerHTML = uiIcon('puzzle', 14) + ' ' + esc(mod.name);
-        grid.appendChild(lab);
-        cards.forEach((el) => grid.appendChild(el));
-      }
-    }
-    // matching mods from the bundled catalog
-    const modMatches = MODS_DB.filter((m) => m.name.toLowerCase().includes(searchTerm) || (m.sum || '').toLowerCase().includes(searchTerm));
-    if (modMatches.length) {
-      any = true;
-      const lab = document.createElement('div');
-      lab.className = 'search-cat-label';
-      lab.innerHTML = uiIcon('puzzle', 14) + ' Mods';
-      grid.appendChild(lab);
-      const d = document.createElement('div');
-      d.className = 'opt-card wide';
-      d.innerHTML = `<p class="opt-help">${modMatches.length} mod${modMatches.length === 1 ? '' : 's'} match in the CurseForge catalog: <b>${modMatches.slice(0, 6).map((m) => esc(m.name)).join(', ')}${modMatches.length > 6 ? '…' : ''}</b></p>`;
-      const b = document.createElement('button');
-      b.className = 'btn small primary';
-      b.innerHTML = uiIcon('puzzle', 16) + ' Open Mod Browser';
-      b.addEventListener('click', () => { openModBrowser(); $('modSearch').value = searchTerm; browserFilter.term = searchTerm; renderModBrowser(); });
-      d.appendChild(b);
-      grid.appendChild(d);
-    }
-    if (!any) {
-      const d = document.createElement('div');
-      d.className = 'empty-msg';
-      d.textContent = 'No settings match your search.';
-      grid.appendChild(d);
-    }
+    renderSearchResults(grid, headEl, searchTerm);
     return;
   }
-
   if (currentCat.startsWith('mod:')) {
     renderModPage(grid, parseInt(currentCat.slice(4), 10));
     return;
@@ -932,43 +1076,9 @@ function render() {
   const cat = CATEGORIES.find((c) => c.id === currentCat);
   headEl.innerHTML = `<h2><span class="h2ic">${uiIcon(cat.icon, 22)}</span> ${esc(cat.name)}</h2><p>${esc(cat.desc)}</p>`;
 
-  if (currentCat === 'launch') {
-    renderLaunchCategory(grid);
-    return;
-  }
-  if (currentCat === 'setup') {
-    renderLocalServerSetup(grid);
-    return;
-  }
-  if (currentCat === 'mods') {
-    renderModsCategory(grid);
-    return;
-  }
-  if (currentCat === 'deploy') {
-    renderDeployCategory(grid);
-    return;
-  }
-
-  const grpsDone = new Set();
-  let shown = 0;
-  for (const o of OPTIONS) {
-    if (o.c !== currentCat) continue;
-    if (changedOnly && !(o.grp ? OPTIONS.some((m) => m.grp === o.grp && isChanged(m)) : isChanged(o))) continue;
-    if (o.grp) {
-      if (grpsDone.has(o.grp)) continue;
-      grpsDone.add(o.grp);
-      grid.appendChild(makeStatGroupCard(o.grp));
-    } else {
-      grid.appendChild(makeCard(o));
-    }
-    shown++;
-  }
-  if (!shown) {
-    const d = document.createElement('div');
-    d.className = 'empty-msg';
-    d.textContent = changedOnly ? 'You haven’t changed anything in this category yet.' : 'Nothing here.';
-    grid.appendChild(d);
-  }
+  const special = SPECIAL_CATEGORY_RENDERERS[currentCat];
+  if (special) special(grid);
+  else renderOptionCategory(grid);
 }
 
 /* ---------------- INI generation ---------------- */
@@ -1024,45 +1134,68 @@ function buildIniFile(file, includeDefaults) {
   return lines.join('\r\n');
 }
 
-/* ---------------- import ----------------
-   Returns true when something was imported (callers keep the pasted text and
-   the dialog open on failure). opts.skipRender leaves the UI untouched so a
-   caller mid-operation (e.g. a deploy read) can re-render once at the end. */
-function importText(text, opts = {}) {
-  const trimmed = text.trim();
-  if (!trimmed) { toast('Nothing to import — the text was empty.'); return false; }
+/* ---------------- import ---------------- */
 
-  // Profile JSON?
-  if (trimmed[0] === '{') {
-    try {
-      const j = JSON.parse(trimmed);
-      if (j && (j.opts || j.launch || j.mods)) {
-        // a profile REPLACES the whole setup — never silently discard local work
-        const hasLocalWork = Object.keys(state.opts).length > 0 || (state.mods || []).length > 0;
-        if (hasLocalWork && !confirm('Load this profile? It REPLACES your current setup (settings and mod list).\nTip: save your current setup first via Presets → Save my setup.')) {
-          return false;
-        }
-        state.opts = j.opts || {};
-        state.launch = j.launch || {};
-        // ids must be numeric — imported profiles are untrusted
-        state.mods = (Array.isArray(j.mods) ? j.mods : [])
-          .map((m) => ({ ...m, id: parseInt(m.id, 10) }))
-          .filter((m) => Number.isFinite(m.id) && m.id > 0);
-        state.modExtra = j.modExtra || {};
-        state.modDynIni = j.modDynIni || {};
-        state.modDocs = j.modDocs || {};
-        state.modContent = j.modContent || {};
-        saveState();
-        if (!opts.skipRender) { buildSidebar(); render(); refreshBadges(); }
-        toast('Profile loaded!');
-        return true;
-      }
-      toast('That JSON file is not an ARK Config Creator profile.');
-      return false;
-    } catch (e) { toast('That JSON file could not be read.'); return false; }
+/** Repaints everything an import may have touched, unless the caller opted out. */
+function afterImportRepaint(opts) {
+  if (opts.skipRender) return;
+  buildSidebar();
+  render();
+  refreshBadges();
+}
+
+/**
+ * Loads a saved profile (.json). A profile REPLACES the whole setup, so the
+ * user is asked first whenever there is local work to lose.
+ *
+ * Profiles written before secret-stripping (and hand-edited ones) may still
+ * contain passwords and RCON settings — those are imported as-is on purpose;
+ * only the *export* side strips them.
+ *
+ * @returns {boolean} true when the profile was applied
+ */
+function importProfileJson(trimmed, opts) {
+  let j;
+  try {
+    j = JSON.parse(trimmed);
+  } catch (e) {
+    toast('That JSON file could not be read.');
+    return false;
+  }
+  if (!j || !(j.opts || j.launch || j.mods)) {
+    toast('That JSON file is not an ARK Config Creator profile.');
+    return false;
   }
 
-  const lines = trimmed.split(/\r?\n/);
+  // a profile REPLACES the whole setup — never silently discard local work
+  const hasLocalWork = Object.keys(state.opts).length > 0 || (state.mods || []).length > 0;
+  if (hasLocalWork && !confirm('Load this profile? It REPLACES your current setup (settings and mod list).\nTip: save your current setup first via Presets → Save my setup.')) {
+    return false;
+  }
+
+  state.opts = j.opts || {};
+  state.launch = j.launch || {};
+  // ids must be numeric — imported profiles are untrusted
+  state.mods = (Array.isArray(j.mods) ? j.mods : [])
+    .map((m) => ({ ...m, id: parseInt(m.id, 10) }))
+    .filter((m) => Number.isFinite(m.id) && m.id > 0);
+  state.modExtra = j.modExtra || {};
+  state.modDynIni = j.modDynIni || {};
+  state.modDocs = j.modDocs || {};
+  state.modContent = j.modContent || {};
+  saveState();
+  afterImportRepaint(opts);
+  toast('Profile loaded!');
+  return true;
+}
+
+/**
+ * Walks the lines of a pasted/dropped .ini and applies every key it knows.
+ * Nothing is rendered or persisted here — the caller does that once.
+ *
+ * @returns {{recognized: number, aseCount: number, unknownBySection: Map<string, string[]>}}
+ */
+function scanIniLines(trimmed) {
   let section = '';
   let modHandler = null;   // active when the current section belongs to a known mod
   let recognized = 0;
@@ -1070,16 +1203,14 @@ function importText(text, opts = {}) {
   const unknownBySection = new Map(); // section -> lines
   const clearedMultiline = new Set();
 
-  const gusSections = new Set(GUS_SECTION_ORDER.map((s) => s.toLowerCase()));
-
-  for (const rawLine of lines) {
+  for (const rawLine of trimmed.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith(';') || line.startsWith('#') || line.startsWith('//')) continue;
     const mSec = line.match(/^\[(.+)\]$/);
     if (mSec) { section = mSec[1].trim(); modHandler = modImportHandler(section); continue; }
     const eq = line.indexOf('=');
     if (eq < 0) continue;
-    let key = line.slice(0, eq).trim();
+    const key = line.slice(0, eq).trim();
     const value = line.slice(eq + 1).trim();
 
     // keys inside a known mod's section always belong to that mod
@@ -1091,17 +1222,21 @@ function importText(text, opts = {}) {
       recognized++;
       if (o.t === 'bool') {
         setValSilent(o, /^(true|1)$/i.test(value));
-      } else if (o.t === 'float' || o.t === 'int') {
-        setValSilent(o, value);
-      } else if (o.t === 'str') {
-        setValSilent(o, value);
-      } else { // text: accumulate lines
+      } else if (o.t === 'text' || o.t === 'raw') {
+        // multi-line settings accumulate every occurrence of the key
         if (!clearedMultiline.has(o.k)) { state.opts[o.k] = ''; clearedMultiline.add(o.k); }
         const cur = state.opts[o.k];
         state.opts[o.k] = (cur ? cur + '\n' : '') + value;
+      } else {
+        setValSilent(o, value);   // float / int / str all store the raw text
       }
     } else {
-      const secKey = section || (looksLikeGameSection(section) ? GAME_SECTION : 'ServerSettings');
+      // Unknown keys are kept verbatim in the Custom / Extra Lines box for the
+      // file the section belongs to. A line before any [Section] header has no
+      // section at all and goes to the GameUserSettings box; the old code had
+      // an unreachable GAME_SECTION branch here (looksLikeGameSection('') can
+      // never be true), which is why this is now a plain fallback.
+      const secKey = section || 'ServerSettings';
       if (!unknownBySection.has(secKey)) unknownBySection.set(secKey, []);
       unknownBySection.get(secKey).push(line);
       if (ASE_ONLY_KEYS.has(key.toLowerCase())) aseCount++;
@@ -1112,14 +1247,23 @@ function importText(text, opts = {}) {
   for (const k of clearedMultiline) {
     if (state.opts[k] === '') delete state.opts[k];
   }
+  return { recognized, aseCount, unknownBySection };
+}
 
-  // route unknown lines to custom boxes
+/**
+ * Appends the lines this tool did not recognise to the right Custom / Extra
+ * Lines box, keeping their section header when it is not one of ours.
+ *
+ * @returns {number} how many lines were actually added (duplicates are skipped)
+ */
+function keepUnknownLines(unknownBySection) {
+  const gusSections = new Set(GUS_SECTION_ORDER.map((s) => s.toLowerCase()));
   let unknownCount = 0;
   for (const [sec, ls] of unknownBySection) {
     const isGame = looksLikeGameSection(sec);
     const targetKey = isGame ? '__customGame' : '__customGUS';
     const o = optByKey.get(targetKey.toLowerCase());
-    let cur = String(getVal(o) ?? '');
+    const cur = String(getVal(o) ?? '');
     const curLines = new Set(cur.split(/\r?\n/).map((l) => l.trim()));
     const add = [];
     const needsHeader = sec && !isGame && !gusSections.has(sec.toLowerCase());
@@ -1131,12 +1275,33 @@ function importText(text, opts = {}) {
       state.opts[o.k] = (cur.trim() ? cur.trim() + '\n' : '') + add.join('\n');
     }
   }
+  return unknownCount;
+}
+
+/** The "Imported: N settings recognized…" sentence shown after an .ini import. */
+function importSummary(recognized, unknownCount, aseCount) {
+  let msg = `Imported: ${recognized} setting${recognized === 1 ? '' : 's'} recognized`
+    + (unknownCount ? `, ${unknownCount} unknown line${unknownCount === 1 ? '' : 's'} kept in Custom / Extra Lines.` : '.');
+  if (aseCount) {
+    msg += ` Warning: ${aseCount} of them ${aseCount === 1 ? 'is an' : 'are'} old-ARK (ASE) setting${aseCount === 1 ? '' : 's'} that ASA ignores.`;
+  }
+  return msg;
+}
+
+/* Returns true when something was imported (callers keep the pasted text and
+   the dialog open on failure). opts.skipRender leaves the UI untouched so a
+   caller mid-operation (e.g. a deploy read) can re-render once at the end. */
+function importText(text, opts = {}) {
+  const trimmed = text.trim();
+  if (!trimmed) { toast('Nothing to import — the text was empty.'); return false; }
+  if (trimmed[0] === '{') return importProfileJson(trimmed, opts);
+
+  const { recognized, aseCount, unknownBySection } = scanIniLines(trimmed);
+  const unknownCount = keepUnknownLines(unknownBySection);
 
   saveState();
-  if (!opts.skipRender) { buildSidebar(); render(); refreshBadges(); }
-  let msg = `Imported: ${recognized} setting${recognized === 1 ? '' : 's'} recognized` + (unknownCount ? `, ${unknownCount} unknown line${unknownCount === 1 ? '' : 's'} kept in Custom / Extra Lines.` : '.');
-  if (aseCount) msg += ` Warning: ${aseCount} of them ${aseCount === 1 ? 'is an' : 'are'} old-ARK (ASE) setting${aseCount === 1 ? '' : 's'} that ASA ignores.`;
-  toast(msg);
+  afterImportRepaint(opts);
+  toast(importSummary(recognized, unknownCount, aseCount));
   // for mods recognized in the import, look up their pages online for the rest
   // of their settings (async — pages update when results arrive)
   afterImportModDiscovery();
@@ -1145,11 +1310,10 @@ function importText(text, opts = {}) {
 function looksLikeGameSection(sec) {
   return /shootergamemode/i.test(sec || '');
 }
+/* Sets an option without persisting or re-rendering — for bulk changes
+   (import, presets, the wizard) that save and repaint once at the end. */
 function setValSilent(o, v) {
-  const same = (o.t === 'bool') ? Boolean(v) === Boolean(o.d)
-    : (o.t === 'float' || o.t === 'int') ? normNum(v) !== null && normNum(v) === normNum(o.d)
-    : String(v ?? '') === String(o.d ?? '');
-  if (same) delete state.opts[o.k];
+  if (isDefaultValue(o, v)) delete state.opts[o.k];
   else state.opts[o.k] = v;
 }
 
@@ -1161,7 +1325,8 @@ function download(name, content) {
   a.download = name;
   document.body.appendChild(a);
   a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  // the object URL has to outlive the click, but not much longer
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, APP_TIMEOUTS.OBJECT_URL_REVOKE_MS);
 }
 function copyText(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1179,6 +1344,9 @@ function copyText(text) {
 }
 
 /* ---------------- export modal ---------------- */
+/** Where the two .ini files have to end up on a Windows server machine. */
+const WINDOWS_CONFIG_HINT_PATH = '…\\ARK Survival Ascended Server\\' + ASA_SERVER.CONFIG_PARTS.join('\\') + '\\';
+
 function refreshExportPreview() {
   const inc = $('chkIncludeDefaults').checked;
   let text;
@@ -1186,78 +1354,164 @@ function refreshExportPreview() {
   else if (exportTab === 'game') text = buildIniFile('game', inc);
   else text = buildBat();
   $('filePreview').textContent = text || '(empty — change some settings first)';
-  $('exportHint').style.display = exportTab === 'bat' ? 'none' : '';
-  const hintBat = 'Put StartServer.bat next to nothing special — just edit the server path inside if needed, then double-click it on your server machine to start the server.';
+  $('exportHint').style.display = '';
   if (exportTab === 'bat') {
-    $('exportHint').style.display = '';
+    const hintBat = `Put ${ASA_SERVER.FILES.START_SCRIPT} next to nothing special — just edit the server path inside if needed, then double-click it on your server machine to start the server.`;
     $('exportHint').innerHTML = '<b>How to use:</b><br>' + esc(hintBat) + '<br>Set the “Server .exe Location” in 🚀 Launch Options so the path is correct.';
   } else {
-    $('exportHint').innerHTML = '<b>Where do these files go?</b><br>On your server machine, place both .ini files in:<br><code>…\\ARK Survival Ascended Server\\ShooterGame\\Saved\\Config\\WindowsServer\\</code><br>(For rented servers, most hosts have a config editor or FTP — upload or paste the files there.) Restart the server afterwards. <b>Tip:</b> back up your old files first!<br><b>Skip the file juggling:</b> the Deploy tab in the sidebar can write these straight to Nitrado, a Pterodactyl panel, or a self-hosted server — with automatic backups.';
+    $('exportHint').innerHTML = '<b>Where do these files go?</b><br>On your server machine, place both .ini files in:<br>'
+      + `<code>${esc(WINDOWS_CONFIG_HINT_PATH)}</code><br>`
+      + '(For rented servers, most hosts have a config editor or FTP — upload or paste the files there.) Restart the server afterwards. '
+      + '<b>Tip:</b> back up your old files first!<br><b>Skip the file juggling:</b> the Deploy tab in the sidebar can write these straight to Nitrado, a Pterodactyl panel, or a self-hosted server — with automatic backups.';
   }
 }
 function exportFileName() {
-  return exportTab === 'gus' ? 'GameUserSettings.ini' : exportTab === 'game' ? 'Game.ini' : 'StartServer.bat';
+  if (exportTab === 'gus') return ASA_SERVER.FILES.GAME_USER_SETTINGS;
+  if (exportTab === 'game') return ASA_SERVER.FILES.GAME;
+  return ASA_SERVER.FILES.START_SCRIPT;
 }
 
-/* ---------------- init ---------------- */
-function init() {
+/* ---------------- shareable profile (.json) ----------------
+   The Presets dialog tells people to save a profile and load it later, and
+   profiles get passed around between server owners. state.opts, however, also
+   holds the admin/join/spectator passwords and the RCON settings, and
+   PRIVACY.txt already promises that connection secrets are excluded from
+   exported profiles. So the export drops them; the import deliberately still
+   accepts them, because profiles written before this change (and hand-made
+   ones) must keep working. */
+const PROFILE_FILE_NAME = 'my-ark-server-profile.json';
+const PROFILE_SECRET_KEY_PATTERN = /password|^rcon/i;
+
+/* Launch fields naming a folder on this machine. PRIVACY.txt also promises
+   that chosen local folders stay local, and they would be wrong on somebody
+   else's PC anyway, so they are stripped from the export too. */
+const PROFILE_LOCAL_PATH_KEYS = ['serverPath', 'clusterDir'];
+
+/** True for option keys that must never leave this PC inside a profile. */
+function isProfileSecretKey(key) {
+  return PROFILE_SECRET_KEY_PATTERN.test(key);
+}
+
+/**
+ * Serialises the current setup for sharing.
+ * @returns {{ json: string, strippedKeys: string[] }}
+ */
+function buildProfileExport() {
+  const opts = {};
+  const strippedKeys = [];
+  for (const [key, value] of Object.entries(state.opts)) {
+    if (isProfileSecretKey(key)) strippedKeys.push(key);
+    else opts[key] = value;
+  }
+  const launch = { ...state.launch };
+  for (const key of PROFILE_LOCAL_PATH_KEYS) {
+    if (launch[key]) { delete launch[key]; strippedKeys.push(key); }
+  }
+  const profile = {
+    opts,
+    launch,
+    mods: state.mods,
+    modExtra: state.modExtra,
+    modDynIni: state.modDynIni,
+    modDocs: state.modDocs,
+    modContent: state.modContent,
+  };
+  return { json: JSON.stringify(profile, null, 2), strippedKeys };
+}
+
+/** Downloads the profile and says out loud which secrets were left out. */
+function downloadProfile() {
+  const { json, strippedKeys } = buildProfileExport();
+  download(PROFILE_FILE_NAME, json);
+  const n = strippedKeys.length;
+  toast(n
+    ? `Profile saved — ${n} password, RCON and local-folder setting${n === 1 ? '' : 's'} left out so the file is safe to share. Load it later via Import.`
+    : 'Profile saved (passwords, RCON settings and local folders are never included) — load it later via Import.');
+}
+
+/* ---------------- init ----------------
+   init() is called exactly once per page load (auth.js guards re-entry after a
+   logout, because binding these one-time listeners twice would duplicate every
+   header button and fire every handler twice). Each init* helper below owns one
+   area of the UI and is safe to read on its own. */
+
+/** Restores the saved setup and paints the first screen. */
+function initState() {
   loadState();
   hydrateIcons();
   document.documentElement.dataset.theme = state.theme === 'light' ? 'light' : 'dark';
   buildSidebar();
   render();
+}
 
+/** Search box, "changed only" filter and the theme toggle. */
+function initFilters() {
   $('searchBox').addEventListener('input', (e) => {
     searchTerm = e.target.value.trim().toLowerCase();
     render();
   });
   $('chkChangedOnly').addEventListener('change', (e) => { changedOnly = e.target.checked; render(); });
-
   $('btnTheme').addEventListener('click', () => {
     state.theme = (document.documentElement.dataset.theme === 'dark') ? 'light' : 'dark';
     document.documentElement.dataset.theme = state.theme;
     saveState();
   });
+}
 
-  // Updates use the same NSIS installer as first-time installs. Selecting a
-  // newer setup file upgrades in place and keeps the app's local data folder.
+/* Updates use the same NSIS installer as first-time installs. Selecting a
+   newer setup file upgrades in place and keeps the app's local data folder.
+   The button stays hidden in the browser build, which cannot install anything. */
+function initUpdateButton() {
   const updateButton = $('btnUpdateApp');
-  if (typeof window.arkcc !== 'undefined' && typeof window.arkcc.installAppUpdate === 'function') {
-    updateButton.hidden = false;
-    updateButton.addEventListener('click', async () => {
-      if (!confirm('Select a newer ARK Config Creator installer to update this app in place? Your accounts, settings, and running local server service will be kept.')) return;
-      updateButton.disabled = true;
-      try {
-        const result = await window.arkcc.installAppUpdate();
-        if (result.canceled) { updateButton.disabled = false; return; }
-        toast('Starting update to version ' + result.version + '…');
-      } catch (error) {
-        updateButton.disabled = false;
-        toast('Could not start the update: ' + error.message);
-      }
-    });
-  }
-
-  $('btnResetAll').addEventListener('click', () => {
-    if (confirm('Reset EVERY setting back to default? This also clears your mod list. This cannot be undone.')) {
-      state.opts = {};
-      state.launch = {};
-      state.mods = [];
-      state.modExtra = {};
-      state.modDynIni = {};
-      state.modDocs = {};
-      state.modContent = {};
-      currentCat = currentCat.startsWith('mod:') ? 'mods' : currentCat;
-      saveState(); buildSidebar(); render(); refreshBadges();
-      toast('All settings reset to defaults.');
+  if (typeof window.arkcc === 'undefined' || typeof window.arkcc.installAppUpdate !== 'function') return;
+  updateButton.hidden = false;
+  updateButton.addEventListener('click', async () => {
+    if (!confirm('Select a newer ARK Config Creator installer to update this app in place? Your accounts, settings, and running local server service will be kept.')) return;
+    updateButton.disabled = true;
+    try {
+      const result = await window.arkcc.installAppUpdate();
+      if (result.canceled) { updateButton.disabled = false; return; }
+      // stays disabled on purpose: the installer is running and this app is
+      // seconds away from being replaced — a second click must not start it twice
+      toast('Starting update to version ' + result.version + '…');
+    } catch (error) {
+      updateButton.disabled = false;
+      toast('Could not start the update: ' + error.message);
     }
   });
+}
 
-  // modals
+/** The destructive "reset everything" header button. */
+function initResetAll() {
+  $('btnResetAll').addEventListener('click', () => {
+    if (!confirm('Reset EVERY setting back to default? This also clears your mod list. This cannot be undone.')) return;
+    state.opts = {};
+    state.launch = {};
+    state.mods = [];
+    state.modExtra = {};
+    state.modDynIni = {};
+    state.modDocs = {};
+    state.modContent = {};
+    // the page for a mod that no longer exists cannot stay selected
+    currentCat = currentCat.startsWith('mod:') ? 'mods' : currentCat;
+    saveState(); buildSidebar(); render(); refreshBadges();
+    toast('All settings reset to defaults.');
+  });
+}
+
+function initHeaderControls() {
+  initFilters();
+  initUpdateButton();
+  initResetAll();
+}
+
+/** Close buttons and click-outside-to-close, for every dialog in the page. */
+function initDialogs() {
   document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => b.closest('dialog').close()));
   document.querySelectorAll('dialog').forEach((d) => d.addEventListener('click', (e) => { if (e.target === d) d.close(); }));
+}
 
-  // export
+function initExportModal() {
   $('btnExport').addEventListener('click', () => { $('dlgExport').showModal(); refreshExportPreview(); });
   document.querySelectorAll('#exportTabs .tab').forEach((t) => t.addEventListener('click', () => {
     document.querySelectorAll('#exportTabs .tab').forEach((x) => x.classList.remove('active'));
@@ -1267,16 +1521,34 @@ function init() {
   }));
   $('chkIncludeDefaults').addEventListener('change', refreshExportPreview);
   $('btnCopyFile').addEventListener('click', () => copyText($('filePreview').textContent).then(() => toast('Copied to clipboard!')));
-  $('btnDownloadFile').addEventListener('click', () => { download(exportFileName(), $('filePreview').textContent); toast(exportFileName() + ' downloaded'); });
+  $('btnDownloadFile').addEventListener('click', () => {
+    download(exportFileName(), $('filePreview').textContent);
+    toast(exportFileName() + ' downloaded');
+  });
   $('btnDownloadAll').addEventListener('click', () => {
     const inc = $('chkIncludeDefaults').checked;
-    download('GameUserSettings.ini', buildIniFile('gus', inc));
-    setTimeout(() => download('Game.ini', buildIniFile('game', inc)), 300);
-    setTimeout(() => download('StartServer.bat', buildBat()), 600);
+    const files = ASA_SERVER.FILES;
+    // browsers drop rapid-fire downloads, so the three are staggered
+    download(files.GAME_USER_SETTINGS, buildIniFile('gus', inc));
+    setTimeout(() => download(files.GAME, buildIniFile('game', inc)), APP_TIMEOUTS.DOWNLOAD_STAGGER_MS);
+    setTimeout(() => download(files.START_SCRIPT, buildBat()), APP_TIMEOUTS.DOWNLOAD_STAGGER_MS * 2);
     toast('Downloading all 3 files…');
   });
+}
 
-  // import
+/** Imports every dropped/selected file, closing the dialog when any succeeded. */
+async function importFiles(fileList) {
+  let anyOk = false;
+  for (const f of fileList) {
+    const text = await f.text();
+    if (importText(text)) anyOk = true;
+  }
+  // a failed file leaves the dialog open with its error toast, so the user can
+  // see what went wrong and try another one
+  if (anyOk) $('dlgImport').close();
+}
+
+function initImportModal() {
   $('btnImport').addEventListener('click', () => $('dlgImport').showModal());
   $('btnDoImport').addEventListener('click', () => {
     // keep the pasted text and the dialog open when the import fails, so the
@@ -1288,37 +1560,24 @@ function init() {
   });
   $('btnPickFile').addEventListener('click', () => $('fileInput').click());
   $('fileInput').addEventListener('change', async (e) => {
-    let anyOk = false;
-    for (const f of e.target.files) {
-      const text = await f.text();
-      if (importText(text)) anyOk = true;
-    }
-    e.target.value = '';
-    if (anyOk) $('dlgImport').close();   // a failed file leaves the dialog open with its error toast
+    const files = [...e.target.files];
+    e.target.value = '';   // reset first, so picking the same file twice still fires
+    await importFiles(files);
   });
+
   const dz = $('dropZone');
   ['dragenter', 'dragover'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('drag'); }));
   ['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('drag'); }));
-  dz.addEventListener('drop', async (e) => {
-    let anyOk = false;
-    for (const f of e.dataTransfer.files) {
-      const text = await f.text();
-      if (importText(text)) anyOk = true;
-    }
-    if (anyOk) $('dlgImport').close();
-  });
+  dz.addEventListener('drop', (e) => importFiles(e.dataTransfer.files));
+}
 
-  // presets
+function initPresetsModal() {
   $('btnPresets').addEventListener('click', () => { buildPresetList(); $('dlgPresets').showModal(); });
-  $('btnSaveProfile').addEventListener('click', () => {
-    download('my-ark-server-profile.json', JSON.stringify({ opts: state.opts, launch: state.launch, mods: state.mods, modExtra: state.modExtra, modDynIni: state.modDynIni, modDocs: state.modDocs, modContent: state.modContent }, null, 2));
-    toast('Profile saved — load it later via Import.');
-  });
+  $('btnSaveProfile').addEventListener('click', downloadProfile);
+}
 
-  // picker
-  $('pickerSearch').addEventListener('input', renderPickerList);
-
-  // Ctrl+F (or "/" outside a field) jumps to the settings search
+/* Ctrl+F (or "/" outside a field) jumps to the settings search. */
+function initHotkeys() {
   document.addEventListener('keydown', (e) => {
     const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '');
     if ((e.ctrlKey && e.key === 'f') || (!inField && e.key === '/')) {
@@ -1327,14 +1586,21 @@ function init() {
       $('searchBox').select();
     }
   });
+}
 
-  // mods
+function init() {
+  initState();
+  initHeaderControls();
+  initDialogs();
+  initExportModal();
+  initImportModal();
+  initPresetsModal();
+  $('pickerSearch').addEventListener('input', renderPickerList);
+  initHotkeys();
   initModsUI();
-
   // legal documents (footer links)
   document.querySelectorAll('[data-legal]').forEach((b) =>
     b.addEventListener('click', () => showLegalDialog(b.dataset.legal)));
-
   // brand-new setup? offer the guided first-run wizard
   maybeShowSetupWizard();
 }
@@ -1343,26 +1609,22 @@ function buildPresetList() {
   const wrap = $('presetList');
   wrap.innerHTML = '';
   for (const p of PRESETS) {
-    const card = document.createElement('div');
-    card.className = 'preset-card';
-    const grow = document.createElement('div');
-    grow.className = 'grow';
-    grow.innerHTML = `<h4>${esc(p.name)}</h4><p>${esc(p.desc)}</p>`;
-    const btn = document.createElement('button');
-    btn.className = 'btn primary small';
-    btn.textContent = 'Apply';
-    btn.addEventListener('click', () => {
-      for (const [k, v] of Object.entries(p.values)) {
-        const o = optByKey.get(k.toLowerCase());
-        if (o) setValSilent(o, v);
-      }
-      saveState(); render(); refreshBadges();
-      $('dlgPresets').close();
-      toast(`Preset applied: ${p.name.replace(/^\S+\s/, '')} — tweak anything you like!`);
+    const card = uiElement('div', { className: 'preset-card', parent: wrap });
+    uiElement('div', { className: 'grow', html: `<h4>${esc(p.name)}</h4><p>${esc(p.desc)}</p>`, parent: card });
+    uiButton(card, {
+      small: true,
+      variant: 'primary',
+      text: 'Apply',
+      onClick: () => {
+        for (const [k, v] of Object.entries(p.values)) {
+          const o = optByKey.get(k.toLowerCase());
+          if (o) setValSilent(o, v);
+        }
+        saveState(); render(); refreshBadges();
+        $('dlgPresets').close();
+        toast(`Preset applied: ${p.name.replace(/^\S+\s/, '')} — tweak anything you like!`);
+      },
     });
-    card.appendChild(grow);
-    card.appendChild(btn);
-    wrap.appendChild(card);
   }
 }
 
