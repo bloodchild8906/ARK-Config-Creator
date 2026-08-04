@@ -1,5 +1,5 @@
 ==========================================================
-  ARK CONFIG CREATOR v1.0.1
+  ARK CONFIG CREATOR v1.0.2
   ARK: Survival Ascended — Server Config Creator
 ==========================================================
 
@@ -12,7 +12,7 @@ WHAT IS THIS?
 HOW TO START IT
   Desktop app (recommended):
     Run the setup from the dist folder
-    ("ARK-Config-Creator-Setup-1.0.1.exe"). A guided
+    ("ARK-Config-Creator-Setup-1.0.2.exe"). A guided
     install wizard walks you through it: welcome page,
     terms, install location, then it can launch the app
     right away. Start menu + desktop shortcuts are

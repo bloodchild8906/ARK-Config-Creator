@@ -7,7 +7,7 @@
 'use strict';
 
 const APP_LEGAL_NAME = 'ARK Config Creator';
-const APP_LEGAL_VERSION = '1.0.1';
+const APP_LEGAL_VERSION = '1.0.2';
 
 const LEGAL_DOCS = {
   terms: {
@@ -90,9 +90,15 @@ WHAT IS STORED, AND WHERE
    Server connection details (hosting provider API tokens, panel URLs, chosen
    local folders) are stored only on this PC. The local server service also
    stores a random loopback-only access token on this PC so the app can
-   reconnect to a running local server after it is reopened. They are deliberately excluded
-   from the profile files you can export and share, so sharing a setup never
-   leaks a token.
+   reconnect to a running local server after it is reopened.
+
+   None of that leaves this PC in a profile file. When you export your setup
+   as .json, the Software removes your server admin password, server password,
+   spectator password, the RCON settings and any local folder paths before
+   writing the file, and tells you how many settings it left out. Sharing a
+   profile therefore cannot leak a password, a token or a path from your
+   machine. Importing a profile still accepts those values, so older or
+   hand-written profiles keep working.
 
 NETWORK CONNECTIONS THE SOFTWARE MAKES
    The Software only reaches the internet when a feature you use needs it:

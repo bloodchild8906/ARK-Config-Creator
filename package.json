@@ -1,7 +1,7 @@
 {
   "name": "ark-config-creator",
   "productName": "ARK Config Creator",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "ARK: Survival Ascended server config creator — friendly settings, mods, and one-click deploys.",
   "author": "ARK Config Creator",
   "license": "MIT",

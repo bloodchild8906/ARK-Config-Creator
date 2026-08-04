@@ -1,5 +1,5 @@
 ﻿==========================================================================
-  ARK Config Creator v1.0.1 — TERMS OF USE
+  ARK Config Creator v1.0.2 — TERMS OF USE
 ==========================================================================
 
 ARK Config Creator ("the Software") is a free, unofficial fan-made tool that

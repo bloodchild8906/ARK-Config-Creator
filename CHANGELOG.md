@@ -2,7 +2,7 @@
 
 All notable changes are documented here.
 
-## Unreleased
+## 1.0.2
 
 A codebase-wide clean-up pass. No feature was removed and the on-disk state
 format is unchanged, so existing accounts, saved setups and profiles keep
