@@ -23,6 +23,9 @@ jobs:
           $tag = '${{ github.ref_name }}'.TrimStart('v')
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ($tag -ne $version) { throw "Tag v$tag does not match package version $version." }
+      # `npm run dist` passes --publish never. electron-builder otherwise tries
+      # to publish by itself as soon as it sees a tag, which fails without a
+      # token — and publishing is the next step's job, not the build's.
       - run: npm run dist
       - name: Create GitHub Release
         shell: pwsh
